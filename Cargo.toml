@@ -1,0 +1,13 @@
+[package]
+name = "mxbot-common"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow          = "1"
+futures-util    = "0.3"
+matrix-sdk      = { version = "0.17", features = ["e2e-encryption", "sqlite", "automatic-room-key-forwarding"] }
+matrix-sdk-crypto = "0.17"
+serde           = { version = "1", features = ["derive"] }
+tokio           = { version = "1", features = ["rt", "sync", "time"] }
+tracing         = "0.1"
