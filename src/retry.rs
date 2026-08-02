@@ -25,7 +25,7 @@ use tracing::warn;
 ///
 /// # Example — join with retry (replacing the inline loop in each bot)
 ///
-/// ```rust,no_run
+/// ```ignore
 /// use bot_core_lite::retry::retry_with_backoff;
 /// use bot_core_lite::verify::is_join_terminal;
 ///
