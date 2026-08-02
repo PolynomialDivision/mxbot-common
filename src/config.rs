@@ -83,6 +83,10 @@ pub struct VerificationConfig {
     /// inviter allow-list as a compatibility fallback.
     #[serde(default)]
     pub allowed_users: Vec<String>,
+    /// Allow first-time TOFU verification for users who currently share at
+    /// least one joined room with the bot.
+    #[serde(default)]
+    pub allow_users_from_joined_rooms: bool,
     /// Maximum lifetime of one verification flow.
     #[serde(default = "default_verification_flow_timeout_secs")]
     pub flow_timeout_secs: u64,
@@ -98,9 +102,25 @@ impl Default for VerificationConfig {
     fn default() -> Self {
         Self {
             allowed_users: Vec::new(),
+            allow_users_from_joined_rooms: false,
             flow_timeout_secs: default_verification_flow_timeout_secs(),
             grant_ttl_secs: default_verification_grant_ttl_secs(),
             max_concurrent: default_verification_max_concurrent(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::VerificationConfig;
+
+    #[test]
+    fn shared_room_verification_is_opt_in() {
+        let default: VerificationConfig = toml::from_str("").unwrap();
+        assert!(!default.allow_users_from_joined_rooms);
+
+        let enabled: VerificationConfig =
+            toml::from_str("allow_users_from_joined_rooms = true").unwrap();
+        assert!(enabled.allow_users_from_joined_rooms);
     }
 }

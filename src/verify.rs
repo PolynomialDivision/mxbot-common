@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 
-use futures_util::StreamExt;
+use futures_util::{stream, StreamExt};
 use matrix_sdk::{
     encryption::verification::{
         SasState, SasVerification, Verification, VerificationRequest, VerificationRequestState,
@@ -16,6 +16,7 @@ use matrix_sdk::{
     ruma::{
         events::{
             key::verification::{request::ToDeviceKeyVerificationRequestEvent, VerificationMethod},
+            room::member::MembershipState,
             room::message::{MessageType, OriginalSyncRoomMessageEvent},
         },
         OwnedDeviceId, OwnedRoomId, OwnedUserId, UserId,
@@ -73,6 +74,7 @@ pub struct VerificationSettings {
     pub flow_timeout: Duration,
     pub grant_ttl: Duration,
     pub max_concurrent: usize,
+    pub allow_users_from_joined_rooms: bool,
 }
 
 impl Default for VerificationSettings {
@@ -81,6 +83,7 @@ impl Default for VerificationSettings {
             flow_timeout: Duration::from_secs(300),
             grant_ttl: Duration::from_secs(600),
             max_concurrent: 8,
+            allow_users_from_joined_rooms: false,
         }
     }
 }
@@ -203,6 +206,7 @@ impl VerificationService {
                 flow_timeout: Duration::from_secs(config.flow_timeout_secs.max(1)),
                 grant_ttl: Duration::from_secs(config.grant_ttl_secs.max(1)),
                 max_concurrent: config.max_concurrent.max(1),
+                allow_users_from_joined_rooms: config.allow_users_from_joined_rooms,
             },
         )
     }
@@ -411,12 +415,12 @@ impl VerificationService {
         let device_id = request_device_id(&request).or(device_hint);
         let existing_trust = self.existing_trust(&user_id).await;
 
-        let needs_grant = authorization_requires_grant(
-            self.inner.allowed_users.contains(&user_id),
-            existing_trust,
-        );
-        let granted = self.consume_grant(&user_id, device_id.as_ref()).await;
-        if needs_grant && !granted {
+        let first_time_allowed = self.inner.allowed_users.contains(&user_id)
+            || (existing_trust == ExistingTrust::Unverified
+                && self.inner.settings.allow_users_from_joined_rooms
+                && self.shares_joined_room(&user_id).await);
+        let needs_grant = authorization_requires_grant(first_time_allowed, existing_trust);
+        if needs_grant && !self.consume_grant(&user_id, device_id.as_ref()).await {
             warn!(
                 user_id = %user_id,
                 transport = ?transport,
@@ -544,6 +548,40 @@ impl VerificationService {
                 ExistingTrust::VerificationViolation
             }
         }
+    }
+
+    async fn shares_joined_room(&self, user_id: &UserId) -> bool {
+        let rooms = self.inner.client.joined_rooms();
+        let room_count = rooms.len();
+        let mut checks = stream::iter(rooms)
+            .map(|room| async move {
+                room.get_member(user_id).await.map(|member| {
+                    member.is_some_and(|member| member.membership() == &MembershipState::Join)
+                })
+            })
+            .buffer_unordered(4);
+        let mut failed_lookups = 0usize;
+
+        while let Some(result) = checks.next().await {
+            match result {
+                Ok(true) => {
+                    info!(user_id = %user_id, "Allowing first-time verification for a user in a shared joined room");
+                    return true;
+                }
+                Ok(false) => {}
+                Err(_) => failed_lookups += 1,
+            }
+        }
+
+        if failed_lookups > 0 {
+            warn!(
+                user_id = %user_id,
+                failed_lookups,
+                room_count,
+                "Could not confirm shared-room membership in all joined rooms"
+            );
+        }
+        false
     }
 
     async fn consume_grant(&self, user_id: &UserId, device_id: Option<&OwnedDeviceId>) -> bool {

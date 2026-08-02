@@ -11,3 +11,6 @@ matrix-sdk-crypto = "0.18"
 serde           = { version = "1", features = ["derive"] }
 tokio           = { version = "1", features = ["rt", "sync", "time"] }
 tracing         = "0.1"
+
+[dev-dependencies]
+toml = "1"
