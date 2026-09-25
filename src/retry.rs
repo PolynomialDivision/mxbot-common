@@ -1,71 +1,83 @@
-//! Generic exponential-backoff retry.
-//!
-//! The join-with-retry loop appears verbatim in every bot's invite handler
-//! (MAX_ATTEMPTS=8, initial delay 2s, doubling to 300s cap). This module
-//! provides the underlying mechanism so bots can express that loop more
-//! concisely and reuse it for other retryable operations.
-//!
-//! Note: the join loop also checks `is_join_terminal` to bail out early on
-//! permanent errors. That check is NOT baked into this function — pass it via
-//! the closure return value (map terminal errors to a distinct type, or check
-//! inside the closure and return a non-retryable variant).
+//! Exponential-backoff helpers.
 
-use std::{future::Future, time::Duration};
+use std::time::Duration;
 
-use tokio::time::sleep;
-use tracing::warn;
+/// Doubling backoff with a ceiling.
+#[derive(Clone, Debug)]
+pub struct Backoff {
+    initial: Duration,
+    max: Duration,
+    current: Duration,
+    jitter: bool,
+}
 
-/// Retry `f` up to `max_attempts` times with exponential backoff.
-///
-/// - Starts at `initial_delay_secs`, doubles each attempt, caps at 300s.
-/// - On success returns `Ok(T)` immediately.
-/// - After all attempts returns the last `Err(E)`.
-///
-/// The closure receives no arguments. Clone any needed state before calling.
-///
-/// # Example — join with retry (replacing the inline loop in each bot)
-///
-/// ```ignore
-/// use bot_core_lite::retry::retry_with_backoff;
-/// use bot_core_lite::verify::is_join_terminal;
-///
-/// let result = retry_with_backoff(8, 2, &format!("join {room_id}"), || {
-///     let client = client.clone();
-///     let alias  = room_or_alias.clone();
-///     let via    = via.clone();
-///     async move {
-///         let r = client.join_room_by_id_or_alias(&alias, &via).await;
-///         // Turn terminal errors into an immediately-returned Err by mapping them
-///         // to a type that signals "do not retry" — or just check inside and abort.
-///         r
-///     }
-/// }).await;
-/// ```
-pub async fn retry_with_backoff<F, Fut, T, E>(
-    max_attempts: u32,
-    initial_delay_secs: u64,
-    label: &str,
-    mut f: F,
-) -> Result<T, E>
-where
-    F: FnMut() -> Fut,
-    Fut: Future<Output = Result<T, E>>,
-    E: std::fmt::Display,
-{
-    let mut delay = initial_delay_secs;
-    for attempt in 1..=max_attempts {
-        match f().await {
-            Ok(v) => return Ok(v),
-            Err(e) if attempt == max_attempts => {
-                warn!("{label}: failed after {max_attempts} attempts: {e}");
-                return Err(e);
-            }
-            Err(e) => {
-                warn!("{label}: attempt {attempt}/{max_attempts} failed: {e}; retry in {delay}s");
-                sleep(Duration::from_secs(delay)).await;
-                delay = (delay * 2).min(300);
-            }
+impl Backoff {
+    pub fn new(initial: Duration, max: Duration) -> Self {
+        Self {
+            initial,
+            max,
+            current: initial,
+            jitter: false,
         }
     }
-    unreachable!()
+
+    /// Add up to ~20% random jitter to each delay, so that many clients
+    /// retrying against the same service spread out.
+    pub fn with_jitter(mut self) -> Self {
+        self.jitter = true;
+        self
+    }
+
+    /// The delay to wait now; the following call returns twice as much
+    /// (capped, plus jitter if enabled).
+    pub fn next_delay(&mut self) -> Duration {
+        let mut delay = self.current;
+        if self.jitter {
+            let max_jitter_ms = ((self.current.as_millis() as u64) / 5).clamp(50, 30_000);
+            delay += Duration::from_millis(jitter_nanos() % (max_jitter_ms + 1));
+        }
+        self.current = (self.current * 2).min(self.max);
+        delay
+    }
+
+    pub fn reset(&mut self) {
+        self.current = self.initial;
+    }
+}
+
+/// Cheap, dependency-free pseudo-randomness; only spreads out retry timing.
+fn jitter_nanos() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::from(d.subsec_nanos()))
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backoff_doubles_caps_and_resets() {
+        let mut backoff = Backoff::new(Duration::from_secs(5), Duration::from_secs(12));
+        assert_eq!(backoff.next_delay(), Duration::from_secs(5));
+        assert_eq!(backoff.next_delay(), Duration::from_secs(10));
+        assert_eq!(backoff.next_delay(), Duration::from_secs(12));
+        assert_eq!(backoff.next_delay(), Duration::from_secs(12));
+        backoff.reset();
+        assert_eq!(backoff.next_delay(), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn jittered_backoff_stays_within_twenty_percent() {
+        let mut b = Backoff::new(Duration::from_secs(2), Duration::from_secs(10)).with_jitter();
+        let d1 = b.next_delay();
+        assert!(d1 >= Duration::from_secs(2) && d1 <= Duration::from_millis(2_400));
+        let d2 = b.next_delay();
+        assert!(d2 >= Duration::from_secs(4) && d2 <= Duration::from_millis(4_800));
+        for _ in 0..5 {
+            let d = b.next_delay();
+            assert!(d >= Duration::from_secs(8) && d <= Duration::from_secs(12));
+        }
+    }
 }

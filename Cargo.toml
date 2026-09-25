@@ -1,16 +1,30 @@
 [package]
 name = "mxbot-common"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
+description = "Shared Matrix infrastructure for the mxbot fleet"
+
+[features]
+default = []
+# Forwards matrix-sdk's test helpers for bots whose tests mock a homeserver.
+testing = ["matrix-sdk/testing"]
 
 [dependencies]
-anyhow          = "1"
-futures-util    = "0.3"
-matrix-sdk      = { version = "0.19.1", features = ["e2e-encryption", "sqlite", "automatic-room-key-forwarding"] }
-matrix-sdk-crypto = "0.19.1"
-serde           = { version = "1", features = ["derive"] }
-tokio           = { version = "1", features = ["rt", "sync", "time"] }
-tracing         = "0.1"
+anyhow             = "1"
+futures-util       = "0.3"
+# The one place the fleet's Matrix SDK is defined. The fork copies `m.mentions`
+# into the cleartext wrapper of encrypted events (MSC3952) so that mention
+# push rules fire in encrypted rooms. Bots use `mxbot_common::matrix_sdk`
+# instead of declaring (and patching) the SDK themselves.
+matrix-sdk         = { git = "https://github.com/PolynomialDivision/matrix-rust-sdk", branch = "msc3952-mentions-encrypted-0.19", features = ["e2e-encryption", "sqlite", "automatic-room-key-forwarding"] }
+matrix-sdk-crypto  = { git = "https://github.com/PolynomialDivision/matrix-rust-sdk", branch = "msc3952-mentions-encrypted-0.19" }
+serde              = { version = "1", features = ["derive"] }
+serde_json         = "1"
+tokio              = { version = "1", features = ["fs", "rt", "sync", "time"] }
+toml               = "1"
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [dev-dependencies]
-toml = "1"
+tempfile = "3"
+tokio    = { version = "1", features = ["macros", "rt-multi-thread"] }

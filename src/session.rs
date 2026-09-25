@@ -1,11 +1,7 @@
 //! Matrix client construction and session restore.
 //!
-//! Replaces the ~30-line startup block that is copy-pasted verbatim into every
-//! bot. The only variation across bots is where the sqlite store lives, and
-//! that path is passed directly as `store_path`.
-//!
-//! Most bots pass their `store/` directory directly; radar-bot passes
-//! `store/matrix_store` because it also keeps a SQLite items DB alongside it.
+//! The only variation across bots is where the sqlite store lives, which is
+//! passed as `store_path`.
 
 use std::{path::Path, time::Duration};
 
@@ -28,21 +24,19 @@ use crate::config::MatrixConfig;
 /// previously passed to `.sqlite_store(...)`. The directory is created if it
 /// does not exist. Returns the ready-to-use client and the resolved OwnedUserId.
 ///
-/// # Usage
-///
-/// ```ignore
-/// // Most bots: store_path = PathBuf::from(env::var("STORE_PATH").unwrap_or("store"))
-/// let (client, user_id) = mxbot_common::session::build_and_restore(
-///     &config.matrix,
-///     &store_path,
-///     config.security.encryption_strategy.into(),
-/// ).await?;
-/// ```
+/// Most bots should use [`crate::Bot::start`], which calls this for the
+/// primary account; call it directly for secondary accounts.
 pub async fn build_and_restore(
     cfg: &MatrixConfig,
     store_path: &Path,
     encryption: CollectStrategy,
 ) -> Result<(Client, OwnedUserId)> {
+    if cfg.access_token.trim().is_empty() {
+        anyhow::bail!(
+            "No Matrix access token for {}: set [matrix] access_token or MATRIX_ACCESS_TOKEN",
+            cfg.user_id
+        );
+    }
     tokio::fs::create_dir_all(store_path).await?;
 
     let client = Client::builder()

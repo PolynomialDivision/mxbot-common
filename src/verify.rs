@@ -29,7 +29,7 @@ use tokio::{
 };
 use tracing::{error, info, warn};
 
-use crate::config::VerificationConfig;
+use crate::config::{UserAllowList, VerificationConfig};
 
 const CANCELLATION_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -120,13 +120,6 @@ enum Reservation {
     Concurrent,
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum AdminCommand {
-    ResetTrust(OwnedUserId),
-    VerifyDevice(OwnedUserId, OwnedDeviceId),
-    Invalid(&'static str),
-}
-
 struct VerificationInner {
     client: Client,
     allowed_users: HashSet<OwnedUserId>,
@@ -179,26 +172,22 @@ impl VerificationService {
     }
 
     /// Construct the standard allowlisted TOFU policy from shared config.
-    pub fn allowlisted_tofu_from_config(
+    ///
+    /// Allowed first-time users are `verification.allowed_users`, or — when
+    /// that is empty — an explicit `allowed_inviters` list. Admins are always
+    /// allowed so that they and the bot can verify each other.
+    pub fn from_config(
         client: Client,
         config: &VerificationConfig,
-        fallback_allowed_users: &[String],
+        inviters: &UserAllowList,
+        admins: &HashSet<OwnedUserId>,
     ) -> Self {
-        let configured_users = if config.allowed_users.is_empty() {
-            fallback_allowed_users
-        } else {
-            &config.allowed_users
-        };
-        let allowed_users = configured_users
-            .iter()
-            .filter_map(|user| match user.parse() {
-                Ok(user_id) => Some(user_id),
-                Err(error) => {
-                    warn!(configured_user_id = user, %error, "Ignoring invalid verification user ID");
-                    None
-                }
-            })
-            .collect();
+        let mut allowed_users =
+            crate::config::parse_user_ids("verification.allowed_users", &config.allowed_users);
+        if config.allowed_users.is_empty() {
+            allowed_users.extend(inviters.entries().cloned());
+        }
+        allowed_users.extend(admins.iter().cloned());
         Self::allowlisted_tofu(
             client,
             allowed_users,
@@ -209,6 +198,11 @@ impl VerificationService {
                 allow_users_from_joined_rooms: config.allow_users_from_joined_rooms,
             },
         )
+    }
+
+    /// Users allowed a first-time (TOFU) verification.
+    pub fn allowed_users(&self) -> &HashSet<OwnedUserId> {
+        &self.inner.allowed_users
     }
 
     /// Register both standard verification request transports.
@@ -238,7 +232,11 @@ impl VerificationService {
             move |event: OriginalSyncRoomMessageEvent, client: Client| {
                 let service = service.clone();
                 async move {
-                    if !matches!(event.content.msgtype, MessageType::VerificationRequest(_)) {
+                    if !matches!(event.content.msgtype, MessageType::VerificationRequest(_))
+                        || client.user_id() == Some(event.sender.as_ref())
+                    {
+                        // Requests the bot sent itself are already being
+                        // driven by the task that sent them.
                         return;
                     }
                     let Some(request) = client
@@ -268,45 +266,6 @@ impl VerificationService {
     /// Grant one specific device a single verification attempt.
     pub async fn grant_device(&self, user_id: OwnedUserId, device_id: OwnedDeviceId) {
         self.insert_grant(user_id, Some(device_id)).await;
-    }
-
-    /// Handle shared verification administration commands from a room message.
-    ///
-    /// Returns `true` when the message was a recognized verification command,
-    /// including unauthorized or malformed attempts.
-    pub async fn handle_admin_command(
-        &self,
-        sender: &UserId,
-        admin_users: &HashSet<OwnedUserId>,
-        body: &str,
-    ) -> bool {
-        let Some(command) = parse_admin_command(body) else {
-            return false;
-        };
-        if !admin_users.contains(sender) {
-            warn!(user_id = %sender, "Ignoring verification command from non-administrator");
-            return true;
-        }
-
-        match command {
-            AdminCommand::ResetTrust(user_id) => {
-                self.grant_user(user_id.clone()).await;
-                info!(admin_user_id = %sender, target_user_id = %user_id, "Created one-shot verification grant");
-            }
-            AdminCommand::VerifyDevice(user_id, device_id) => {
-                self.grant_device(user_id.clone(), device_id.clone()).await;
-                if let Err(error) = self.request_device_verification(&user_id, &device_id).await {
-                    self.consume_grant(&user_id, Some(&device_id)).await;
-                    warn!(admin_user_id = %sender, target_user_id = %user_id, device_id = %device_id, %error, "Could not start administrator-approved verification");
-                } else {
-                    info!(admin_user_id = %sender, target_user_id = %user_id, device_id = %device_id, "Started administrator-approved to-device verification");
-                }
-            }
-            AdminCommand::Invalid(reason) => {
-                warn!(admin_user_id = %sender, reason, "Ignoring malformed verification command");
-            }
-        }
-        true
     }
 
     async fn insert_grant(&self, user_id: OwnedUserId, device_id: Option<OwnedDeviceId>) {
@@ -347,6 +306,34 @@ impl VerificationService {
             .await?;
         self.spawn(request, Some(device_id.to_owned()));
         Ok(())
+    }
+
+    /// Ask `user_id` to verify with the bot (SAS in the direct chat shared
+    /// with them). Used by admins to establish mutual verification.
+    pub async fn request_user_verification(&self, user_id: &UserId) -> anyhow::Result<()> {
+        let Some(identity) = self
+            .inner
+            .client
+            .encryption()
+            .get_user_identity(user_id)
+            .await?
+        else {
+            anyhow::bail!("no cross-signing identity known for {user_id}; set up secure backup/cross-signing in your client first");
+        };
+        let request = identity
+            .request_verification_with_methods(vec![VerificationMethod::SasV1])
+            .await?;
+        self.spawn(request, None);
+        Ok(())
+    }
+
+    /// Human-readable trust state of `user_id` as seen by the bot.
+    pub async fn trust_summary(&self, user_id: &UserId) -> &'static str {
+        match self.existing_trust(user_id).await {
+            ExistingTrust::Verified => "verified",
+            ExistingTrust::Unverified => "not verified",
+            ExistingTrust::VerificationViolation => "identity changed since verification",
+        }
     }
 
     async fn handle_request(
@@ -431,14 +418,16 @@ impl VerificationService {
             return;
         }
 
-        info!(user_id = %user_id, transport = ?transport, "Accepting verification request");
-        if let Err(error) = request
-            .accept_with_methods(vec![VerificationMethod::SasV1])
-            .await
-        {
-            error!(user_id = %user_id, %error, "Failed to accept verification request");
-            cancel_request(&request).await;
-            return;
+        if !request.we_started() {
+            info!(user_id = %user_id, transport = ?transport, "Accepting verification request");
+            if let Err(error) = request
+                .accept_with_methods(vec![VerificationMethod::SasV1])
+                .await
+            {
+                error!(user_id = %user_id, %error, "Failed to accept verification request");
+                cancel_request(&request).await;
+                return;
+            }
         }
 
         let mut changes = request.changes();
@@ -455,6 +444,15 @@ impl VerificationService {
                         }
                     }
                     return;
+                }
+                VerificationRequestState::Ready { .. } if request.we_started() => {
+                    // We asked for this verification; as the requester we
+                    // start SAS once the other side is ready.
+                    if let Err(error) = request.start_sas().await {
+                        error!(user_id = %user_id, %error, "Failed to start SAS verification");
+                        cancel_request(&request).await;
+                        return;
+                    }
                 }
                 VerificationRequestState::Done => return,
                 VerificationRequestState::Cancelled(info) => {
@@ -608,34 +606,6 @@ fn authorization_requires_grant(allowed: bool, existing_trust: ExistingTrust) ->
     !allowed || existing_trust != ExistingTrust::Unverified
 }
 
-fn parse_admin_command(body: &str) -> Option<AdminCommand> {
-    let mut parts = body.split_whitespace();
-    match parts.next()? {
-        "!reset-trust" => {
-            let (Some(user), None) = (parts.next(), parts.next()) else {
-                return Some(AdminCommand::Invalid("expected exactly one Matrix user ID"));
-            };
-            Some(match user.parse() {
-                Ok(user_id) => AdminCommand::ResetTrust(user_id),
-                Err(_) => AdminCommand::Invalid("invalid Matrix user ID"),
-            })
-        }
-        "!verify-device" => {
-            let (Some(user), Some(device), None) = (parts.next(), parts.next(), parts.next())
-            else {
-                return Some(AdminCommand::Invalid(
-                    "expected exactly a Matrix user ID and device ID",
-                ));
-            };
-            Some(match user.parse() {
-                Ok(user_id) => AdminCommand::VerifyDevice(user_id, OwnedDeviceId::from(device)),
-                Err(_) => AdminCommand::Invalid("invalid Matrix user ID"),
-            })
-        }
-        _ => None,
-    }
-}
-
 fn reserve_flow(active: &mut HashSet<FlowKey>, flow: &FlowKey) -> Reservation {
     if active.contains(flow) {
         Reservation::Duplicate
@@ -711,30 +681,6 @@ async fn cancel_sas(sas: &SasVerification) {
             warn!(user_id = %sas.other_device().user_id(), device_id = %sas.other_device().device_id(), "Timed out while sending SAS cancellation");
         }
     }
-}
-
-/// Legacy entry point retained while other bots migrate to [`VerificationService`].
-pub async fn handle_verification_request(
-    client: Client,
-    reset_allowed: Arc<Mutex<HashSet<OwnedUserId>>>,
-    request: VerificationRequest,
-) {
-    let user_id = request.other_user_id().to_owned();
-    let allowed = HashSet::from([user_id.clone()]);
-    let service = VerificationService::allowlisted_tofu(client, allowed, Default::default());
-    if reset_allowed.lock().await.remove(&user_id) {
-        service.grant_user(user_id).await;
-    }
-    service.handle_request(request, None).await;
-}
-
-/// Returns true for Matrix join errors that will not resolve with a retry.
-pub fn is_join_terminal(error: &matrix_sdk::Error) -> bool {
-    let message = error.to_string();
-    message.contains("No known servers")
-        || message.contains("M_FORBIDDEN")
-        || message.contains("M_UNKNOWN_TOKEN")
-        || message.contains("M_GUEST_ACCESS_FORBIDDEN")
 }
 
 #[cfg(test)]
@@ -831,27 +777,5 @@ mod tests {
             true,
             ExistingTrust::VerificationViolation
         ));
-    }
-
-    #[test]
-    fn verification_admin_commands_are_strict() {
-        assert_eq!(
-            parse_admin_command("!reset-trust @alice:example.org"),
-            Some(AdminCommand::ResetTrust(
-                user_id!("@alice:example.org").to_owned()
-            ))
-        );
-        assert_eq!(
-            parse_admin_command("!verify-device @alice:example.org DEVICE"),
-            Some(AdminCommand::VerifyDevice(
-                user_id!("@alice:example.org").to_owned(),
-                device_id!("DEVICE").to_owned()
-            ))
-        );
-        assert!(matches!(
-            parse_admin_command("!verify-device @alice:example.org"),
-            Some(AdminCommand::Invalid(_))
-        ));
-        assert!(parse_admin_command("!health").is_none());
     }
 }
