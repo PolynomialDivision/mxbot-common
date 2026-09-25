@@ -163,14 +163,19 @@ impl Bot {
         rooms::join_pending_invites(&self.client, &self.invites).await;
     }
 
-    /// The long-running sync loop.
-    pub async fn sync_forever(&self) -> ! {
-        sync::sync_forever(&self.client).await
+    /// Sync until SIGTERM/SIGINT, then return so `main` can exit cleanly
+    /// (instead of being killed by `docker stop` after its timeout).
+    pub async fn run(&self) -> anyhow::Result<()> {
+        self.run_with(|| {}).await
     }
 
-    /// [`Bot::sync_forever`], calling `on_reconnect` whenever the loop restarts.
-    pub async fn sync_forever_with(&self, on_reconnect: impl FnMut()) -> ! {
-        sync::sync_forever_with(&self.client, on_reconnect).await
+    /// [`Bot::run`], calling `on_reconnect` whenever the sync loop restarts.
+    pub async fn run_with(&self, on_reconnect: impl FnMut()) -> anyhow::Result<()> {
+        tokio::select! {
+            _ = sync::sync_forever_with(&self.client, on_reconnect) => {}
+            () = sync::shutdown_signal() => {}
+        }
+        Ok(())
     }
 
     /// Joined rooms for broadcast posts: allowed rooms, without admin

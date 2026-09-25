@@ -1,4 +1,4 @@
-//! Initial sync and the long-running sync loop.
+//! Initial sync, the long-running sync loop and shutdown handling.
 
 use std::time::{Duration, Instant};
 
@@ -46,11 +46,8 @@ pub async fn initial_sync(client: &Client) {
 ///
 /// `client.sync()` already retries transient errors internally; returning
 /// means it gave up (e.g. an extended homeserver outage).
-pub async fn sync_forever(client: &Client) -> ! {
-    sync_forever_with(client, || {}).await
-}
-
-/// [`sync_forever`], calling `on_reconnect` each time the loop restarts.
+///
+/// `on_reconnect` is called each time the loop restarts.
 pub async fn sync_forever_with(client: &Client, mut on_reconnect: impl FnMut()) -> ! {
     let mut backoff = Backoff::new(RETRY_INITIAL, RETRY_MAX);
     loop {
@@ -69,5 +66,34 @@ pub async fn sync_forever_with(client: &Client, mut on_reconnect: impl FnMut()) 
             "Waiting before Matrix sync reconnect"
         );
         sleep(delay).await;
+    }
+}
+
+/// Resolves on SIGTERM (what `docker stop` sends) or SIGINT (Ctrl-C).
+pub async fn shutdown_signal() {
+    let ctrl_c = async {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            warn!(%error, "Failed to listen for SIGINT");
+            std::future::pending::<()>().await;
+        }
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(error) => {
+                warn!(%error, "Failed to listen for SIGTERM");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => info!("Received SIGINT — shutting down"),
+        _ = terminate => info!("Received SIGTERM — shutting down"),
     }
 }

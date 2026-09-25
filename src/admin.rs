@@ -43,6 +43,28 @@ use crate::{
     verify::VerificationService,
 };
 
+/// Error returned by commands only admins may run. Bots check for it with
+/// `error.is::<NotAdmin>()` and answer with their own wording.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NotAdmin;
+
+impl std::fmt::Display for NotAdmin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("this command requires admin privileges")
+    }
+}
+
+impl std::error::Error for NotAdmin {}
+
+/// `Ok` if `user_id` is one of `admins`, otherwise [`NotAdmin`].
+pub fn require_admin(admins: &HashSet<OwnedUserId>, user_id: &UserId) -> Result<(), NotAdmin> {
+    if admins.contains(user_id) {
+        Ok(())
+    } else {
+        Err(NotAdmin)
+    }
+}
+
 /// What the bot should do with a message after the console saw it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Dispatch {
@@ -429,6 +451,15 @@ fn parse_verify_device<'a>(mut parts: impl Iterator<Item = &'a str>) -> Command 
 mod tests {
     use super::*;
     use matrix_sdk::ruma::{device_id, user_id};
+
+    #[test]
+    fn require_admin_is_a_typed_error() {
+        let admins = HashSet::from([user_id!("@admin:example.org").to_owned()]);
+        assert!(require_admin(&admins, user_id!("@admin:example.org")).is_ok());
+        let error =
+            anyhow::Error::from(require_admin(&admins, user_id!("@eve:example.org")).unwrap_err());
+        assert!(error.is::<NotAdmin>());
+    }
 
     #[test]
     fn console_commands_are_parsed_strictly() {
