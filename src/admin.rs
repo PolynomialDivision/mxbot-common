@@ -162,7 +162,12 @@ impl AdminConsole {
         admin_dm_partner(room, &self.inner.admins).is_some()
     }
 
-    fn access(&self, room: &Room, sender: &UserId, encryption: Option<&EncryptionInfo>) -> Access {
+    async fn access(
+        &self,
+        room: &Room,
+        sender: &UserId,
+        encryption: Option<&EncryptionInfo>,
+    ) -> Access {
         if !self.inner.policy.enabled || !self.is_admin(sender) {
             return Access::None;
         }
@@ -179,6 +184,8 @@ impl AdminConsole {
         if self.inner.policy.require_verified_device {
             match encryption.map(|info| &info.verification_state) {
                 Some(VerificationState::Verified) => {}
+                Some(VerificationState::Unverified(VerificationLevel::UnverifiedIdentity))
+                    if self.verified_since(sender, encryption).await => {}
                 Some(VerificationState::Unverified(level)) => {
                     return Access::Unverified(unverified_reason(Some(level)))
                 }
@@ -186,6 +193,32 @@ impl AdminConsole {
             }
         }
         Access::Granted
+    }
+
+    /// Whether the device a message came from is verified *now*.
+    ///
+    /// matrix-sdk stores how trusted a room key's sender was when the key
+    /// arrived and never re-checks `SenderUnverified` keys
+    /// (`SenderData::should_recalculate`). Messages from a session the admin's
+    /// client set up before we verified each other keep saying "unverified
+    /// identity" until the client rotates it — which can take a week. The
+    /// key's sender device is still known for such messages, so ask about it
+    /// afresh: cross-signed by its owner, and the owner verified by us (what
+    /// `Verified` would mean), with no identity change in between.
+    async fn verified_since(&self, sender: &UserId, encryption: Option<&EncryptionInfo>) -> bool {
+        let Some(device_id) = encryption.and_then(|info| info.sender_device.as_deref()) else {
+            return false;
+        };
+        let encryption = self.inner.client.encryption();
+        let identity_ok = matches!(
+            encryption.get_user_identity(sender).await,
+            Ok(Some(identity)) if identity.is_verified() && !identity.has_verification_violation()
+        );
+        identity_ok
+            && matches!(
+                encryption.get_device(sender, device_id).await,
+                Ok(Some(device)) if device.is_verified_with_cross_signing()
+            )
     }
 
     /// Inspect a room message. Call this first in the bot's message handler
@@ -206,7 +239,7 @@ impl AdminConsole {
         let sender = event.sender.as_ref();
         let command = parse(body);
 
-        match self.access(room, sender, encryption) {
+        match self.access(room, sender, encryption).await {
             Access::Granted => match command {
                 Some(command) => {
                     let reply = self.run(sender, command).await;
