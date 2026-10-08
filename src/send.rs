@@ -23,6 +23,13 @@ const MAX_ATTEMPTS: u32 = 4;
 const INITIAL_BACKOFF: Duration = Duration::from_secs(2);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
+/// Classify a failed request as retryable (5xx, 429 / `M_LIMIT_EXCEEDED`,
+/// network), with any server-suggested delay (`retry_after`). Also for
+/// requests other than sends — creating a room, inviting.
+pub fn classify_error(error: &matrix_sdk::Error) -> (bool, Option<Duration>) {
+    classify_send_error(error)
+}
+
 /// Classify a send failure as retryable, with any server-suggested delay
 /// (`M_LIMIT_EXCEEDED`'s `retry_after`).
 fn classify_send_error(error: &matrix_sdk::Error) -> (bool, Option<Duration>) {

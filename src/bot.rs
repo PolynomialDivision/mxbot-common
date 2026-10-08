@@ -12,7 +12,7 @@ use tracing::{info, warn};
 use crate::{
     admin::AdminConsole,
     config::{MatrixConfig, SecurityConfig},
-    rooms::{self, InvitePolicy},
+    rooms::{self, DynamicRooms, InvitePolicy},
     session,
     settings::SettingsStore,
     sync,
@@ -27,6 +27,7 @@ pub struct BotBuilder {
     matrix_store_path: Option<PathBuf>,
     settings: Option<SettingsStore>,
     admin_help: Option<String>,
+    dynamic_rooms: DynamicRooms,
 }
 
 impl BotBuilder {
@@ -46,6 +47,13 @@ impl BotBuilder {
     /// Runtime settings admins may change with `!admin set`.
     pub fn settings(mut self, settings: SettingsStore) -> Self {
         self.settings = Some(settings);
+        self
+    }
+
+    /// Rooms the bot may be invited to besides `[security] allowed_rooms`,
+    /// changeable while it runs (e.g. rooms admins authorize by command).
+    pub fn dynamic_rooms(mut self, rooms: DynamicRooms) -> Self {
+        self.dynamic_rooms = rooms;
         self
     }
 
@@ -99,6 +107,7 @@ impl BotBuilder {
         let invites = InvitePolicy {
             inviters: security.allowed_inviters.clone(),
             rooms: security.allowed_rooms.clone(),
+            dynamic_rooms: self.dynamic_rooms,
             admins: Arc::clone(&admins),
         };
         rooms::install_invite_handler(&client, invites.clone());
@@ -146,6 +155,7 @@ impl Bot {
             matrix_store_path: None,
             settings: None,
             admin_help: None,
+            dynamic_rooms: DynamicRooms::default(),
         }
     }
 

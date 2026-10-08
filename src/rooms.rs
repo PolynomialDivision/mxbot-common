@@ -1,6 +1,10 @@
 //! Invites, joining, and room classification.
 
-use std::{collections::HashSet, sync::Arc, time::Duration};
+use std::{
+    collections::HashSet,
+    sync::{Arc, RwLock},
+    time::Duration,
+};
 
 use matrix_sdk::{
     ruma::{
@@ -19,11 +23,51 @@ use crate::{
 
 const JOIN_MAX_ATTEMPTS: u32 = 8;
 
+/// Rooms allowed at runtime on top of `[security] allowed_rooms` — rooms an
+/// admin authorized through a bot command, say. A shared handle: the bot
+/// updates it, the invite handler reads it. Cheap to clone.
+#[derive(Clone, Debug, Default)]
+pub struct DynamicRooms(Arc<RwLock<HashSet<OwnedRoomId>>>);
+
+impl DynamicRooms {
+    pub fn new(rooms: impl IntoIterator<Item = OwnedRoomId>) -> Self {
+        Self(Arc::new(RwLock::new(rooms.into_iter().collect())))
+    }
+
+    /// Replace the whole set.
+    pub fn set(&self, rooms: impl IntoIterator<Item = OwnedRoomId>) {
+        *self.0.write().unwrap_or_else(|e| e.into_inner()) = rooms.into_iter().collect();
+    }
+
+    pub fn insert(&self, room_id: OwnedRoomId) {
+        self.0
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(room_id);
+    }
+
+    pub fn remove(&self, room_id: &RoomId) {
+        self.0
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(room_id);
+    }
+
+    pub fn contains(&self, room_id: &RoomId) -> bool {
+        self.0
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(room_id)
+    }
+}
+
 /// Who may pull the bot into which rooms.
 #[derive(Clone, Debug)]
 pub struct InvitePolicy {
     pub inviters: UserAllowList,
     pub rooms: RoomAllowList,
+    /// Rooms allowed at runtime, in addition to `rooms`.
+    pub dynamic_rooms: DynamicRooms,
     /// Admins may always invite the bot, and their direct chats bypass the
     /// room allow-list (their room IDs cannot be known in advance).
     pub admins: Arc<HashSet<OwnedUserId>>,
@@ -54,7 +98,7 @@ impl InvitePolicy {
             };
         if !inviter_ok {
             InviteDecision::RejectInviter
-        } else if !self.rooms.allows(room_id) {
+        } else if !self.rooms.allows(room_id) && !self.dynamic_rooms.contains(room_id) {
             InviteDecision::RejectRoom
         } else {
             InviteDecision::Accept
@@ -238,8 +282,29 @@ mod tests {
         InvitePolicy {
             inviters,
             rooms,
+            dynamic_rooms: DynamicRooms::default(),
             admins: Arc::new(HashSet::from([user_id!("@admin:example.org").to_owned()])),
         }
+    }
+
+    #[test]
+    fn rooms_allowed_at_runtime_join_the_static_list() {
+        let p = policy(
+            UserAllowList::Only(HashSet::new()),
+            RoomAllowList::Only(HashSet::new()),
+        );
+        let admin = Some(user_id!("@admin:example.org"));
+        let room = room_id!("!house:example.org");
+        assert_eq!(p.decide(admin, room, false), InviteDecision::RejectRoom);
+        p.dynamic_rooms.insert(room.to_owned());
+        assert_eq!(p.decide(admin, room, false), InviteDecision::Accept);
+        // Still only for allowed inviters.
+        assert_eq!(
+            p.decide(Some(user_id!("@eve:example.org")), room, false),
+            InviteDecision::RejectInviter
+        );
+        p.dynamic_rooms.remove(room);
+        assert_eq!(p.decide(admin, room, false), InviteDecision::RejectRoom);
     }
 
     #[test]

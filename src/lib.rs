@@ -5,6 +5,7 @@
 //! * [`format`] / [`send`] — mention-aware messages and idempotent sending.
 //! * [`admin`] — admin commands in direct chats with configured admins.
 //! * [`settings`] / [`persist`] — persisted runtime settings and JSON state.
+//! * [`private`] — private 1:1 chats and fresh membership checks.
 //! * [`matrix_sdk`] — the fleet's (forked) Matrix SDK; bots use this
 //!   re-export instead of depending on the SDK themselves.
 
@@ -14,6 +15,7 @@ pub mod config;
 pub mod format;
 pub mod logging;
 pub mod persist;
+pub mod private;
 pub mod retry;
 pub mod rooms;
 pub mod send;
