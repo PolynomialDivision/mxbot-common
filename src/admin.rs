@@ -18,8 +18,9 @@
 //! room is the bot's direct chat with exactly that admin; the message was
 //! end-to-end encrypted (unless `require_encryption = false`); and — if
 //! `require_verified_device = true` — it was sent from a device the bot has
-//! verified. `!reset-trust` / `!verify-device` keep working silently in
-//! shared rooms for compatibility.
+//! verified (from an unverified device only `!admin verify` runs, so the
+//! admin can get verified). `!reset-trust` / `!verify-device` keep working
+//! silently in shared rooms for compatibility.
 //!
 //! Bot-specific commands sent by an admin in such a chat are reported as
 //! [`Dispatch::AdminDm`] so the bot can run them and answer privately.
@@ -84,6 +85,9 @@ enum Access {
     /// Not an admin direct chat (or not from its admin).
     None,
     Denied(&'static str),
+    /// An admin's encrypted direct chat, but the device isn't verified yet:
+    /// only `!admin verify` runs, so the admin can fix exactly that.
+    Unverified,
     Granted,
 }
 
@@ -176,9 +180,7 @@ impl AdminConsole {
             && !encryption
                 .is_some_and(|info| info.verification_state == VerificationState::Verified)
         {
-            return Access::Denied(
-                "admin commands need a verified device — verify this session with the bot (!admin verify) or with your other sessions",
-            );
+            return Access::Unverified;
         }
         Access::Granted
     }
@@ -210,6 +212,17 @@ impl AdminConsole {
                 }
                 None => Dispatch::AdminDm,
             },
+            Access::Unverified if command.as_ref().is_some_and(runs_from_unverified_device) => {
+                let reply = self.run(sender, command.expect("checked above")).await;
+                self.reply(room, reply).await;
+                Dispatch::Handled
+            }
+            Access::Unverified => {
+                let reason = "admin commands need a verified device — verify this session with the bot (!admin verify) or with your other sessions";
+                warn!(user_id = %sender, room_id = %room.room_id(), reason, "Refusing admin command");
+                self.reply(room, format!("⛔ {reason}.")).await;
+                Dispatch::Handled
+            }
             Access::Denied(reason) => {
                 warn!(user_id = %sender, room_id = %room.room_id(), reason, "Refusing admin command");
                 self.reply(room, format!("⛔ {reason}.")).await;
@@ -437,6 +450,14 @@ fn parse_reset_trust<'a>(mut parts: impl Iterator<Item = &'a str>) -> Command {
     }
 }
 
+/// What an admin may run from a device the bot hasn't verified yet: only
+/// starting the verification itself. It changes no trust on its own — the
+/// first verification of an admin is trust on first use (as when the admin
+/// starts it from their client), and re-verifying needs `!reset-trust`.
+fn runs_from_unverified_device(command: &Command) -> bool {
+    matches!(command, Command::Verify)
+}
+
 fn parse_verify_device<'a>(mut parts: impl Iterator<Item = &'a str>) -> Command {
     let (Some(user), Some(device), None) = (parts.next(), parts.next(), parts.next()) else {
         return Command::Invalid("expected exactly a Matrix user ID and device ID");
@@ -484,6 +505,23 @@ mod tests {
         ));
         assert_eq!(parse("!health"), None);
         assert_eq!(parse("!set foo"), None);
+    }
+
+    #[test]
+    fn an_unverified_device_may_only_start_verification() {
+        assert!(runs_from_unverified_device(&Command::Verify));
+        for body in [
+            "!admin",
+            "!admin status",
+            "!admin settings",
+            "!admin set key value",
+            "!admin unset key",
+            "!admin reset-trust @alice:example.org",
+            "!verify-device @alice:example.org DEVICE",
+        ] {
+            let command = parse(body).unwrap();
+            assert!(!runs_from_unverified_device(&command), "{body}");
+        }
     }
 
     #[test]
