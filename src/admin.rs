@@ -28,7 +28,7 @@
 use std::{collections::HashSet, sync::Arc, time::Instant};
 
 use matrix_sdk::{
-    deserialized_responses::{EncryptionInfo, VerificationState},
+    deserialized_responses::{EncryptionInfo, VerificationLevel, VerificationState},
     ruma::{
         events::room::message::{
             MessageType, OriginalSyncRoomMessageEvent, RoomMessageEventContent,
@@ -87,7 +87,7 @@ enum Access {
     Denied(&'static str),
     /// An admin's encrypted direct chat, but the device isn't verified yet:
     /// only `!admin verify` runs, so the admin can fix exactly that.
-    Unverified,
+    Unverified(&'static str),
     Granted,
 }
 
@@ -176,11 +176,14 @@ impl AdminConsole {
                 "admin commands need an end-to-end encrypted chat — enable encryption here or start a new encrypted direct chat",
             );
         }
-        if self.inner.policy.require_verified_device
-            && !encryption
-                .is_some_and(|info| info.verification_state == VerificationState::Verified)
-        {
-            return Access::Unverified;
+        if self.inner.policy.require_verified_device {
+            match encryption.map(|info| &info.verification_state) {
+                Some(VerificationState::Verified) => {}
+                Some(VerificationState::Unverified(level)) => {
+                    return Access::Unverified(unverified_reason(Some(level)))
+                }
+                None => return Access::Unverified(unverified_reason(None)),
+            }
         }
         Access::Granted
     }
@@ -212,14 +215,14 @@ impl AdminConsole {
                 }
                 None => Dispatch::AdminDm,
             },
-            Access::Unverified if command.as_ref().is_some_and(runs_from_unverified_device) => {
+            Access::Unverified(_) if command.as_ref().is_some_and(runs_from_unverified_device) => {
                 let reply = self.run(sender, command.expect("checked above")).await;
                 self.reply(room, reply).await;
                 Dispatch::Handled
             }
-            Access::Unverified => {
-                let reason = "admin commands need a verified device — verify this session with the bot (!admin verify) or with your other sessions";
-                warn!(user_id = %sender, room_id = %room.room_id(), reason, "Refusing admin command");
+            Access::Unverified(reason) => {
+                let device = encryption.and_then(|info| info.sender_device.as_deref());
+                warn!(user_id = %sender, device_id = ?device, room_id = %room.room_id(), reason, "Refusing admin command");
                 self.reply(room, format!("⛔ {reason}.")).await;
                 Dispatch::Handled
             }
@@ -450,6 +453,26 @@ fn parse_reset_trust<'a>(mut parts: impl Iterator<Item = &'a str>) -> Command {
     }
 }
 
+/// Why a message doesn't count as coming from a verified device, and what
+/// the admin can do about it.
+fn unverified_reason(level: Option<&VerificationLevel>) -> &'static str {
+    match level {
+        Some(VerificationLevel::UnverifiedIdentity) => {
+            "admin commands need a verified device — you and I aren't verified yet: run !admin verify"
+        }
+        Some(VerificationLevel::VerificationViolation) => {
+            "admin commands need a verified device — your identity changed since we verified; another admin can allow a re-verification with !reset-trust <you>"
+        }
+        Some(VerificationLevel::UnsignedDevice) => {
+            "admin commands need a verified device — you and I are verified, but this session isn't verified by you: verify it with one of your other sessions or your recovery key (Element: Settings → Sessions)"
+        }
+        Some(VerificationLevel::None(_)) => {
+            "admin commands need a verified device — I don't know the session this came from (yet): send it again in a minute; if that doesn't help, verify this session with your other sessions"
+        }
+        _ => "admin commands need a verified device — verify this session with the bot (!admin verify) or with your other sessions",
+    }
+}
+
 /// What an admin may run from a device the bot hasn't verified yet: only
 /// starting the verification itself. It changes no trust on its own — the
 /// first verification of an admin is trust on first use (as when the admin
@@ -505,6 +528,22 @@ mod tests {
         ));
         assert_eq!(parse("!health"), None);
         assert_eq!(parse("!set foo"), None);
+    }
+
+    #[test]
+    fn an_unverified_device_is_told_what_to_do() {
+        use matrix_sdk::deserialized_responses::DeviceLinkProblem;
+        assert!(
+            unverified_reason(Some(&VerificationLevel::UnverifiedIdentity))
+                .contains("!admin verify")
+        );
+        assert!(unverified_reason(Some(&VerificationLevel::UnsignedDevice))
+            .contains("this session isn't verified by you"));
+        assert!(unverified_reason(Some(&VerificationLevel::None(
+            DeviceLinkProblem::MissingDevice
+        )))
+        .contains("send it again"));
+        assert!(unverified_reason(None).contains("!admin verify"));
     }
 
     #[test]
