@@ -20,7 +20,7 @@ use crate::config::MatrixConfig;
 /// Build a Matrix client, restore the token session, optionally recover
 /// cross-signing keys from secure backup, and bootstrap cross-signing.
 ///
-/// `store_path` is passed directly to the sqlite store — pass exactly what you
+/// `store_path` is passed directly to the sqlite store: pass exactly what you
 /// previously passed to `.sqlite_store(...)`. The directory is created if it
 /// does not exist. Returns the ready-to-use client and the resolved OwnedUserId.
 ///
@@ -75,7 +75,7 @@ pub async fn build_and_restore(
     if let Some(ref key) = cfg.recovery_key {
         match client.encryption().recovery().recover(key).await {
             Ok(()) => info!("Cross-signing keys recovered from secure backup"),
-            Err(e) => warn!("Recovery failed (non-fatal — continuing without): {e}"),
+            Err(e) => warn!("Recovery failed (non-fatal, continuing without): {e}"),
         }
     }
 
@@ -97,7 +97,7 @@ pub async fn bootstrap_cross_signing(client: &Client, user_id: &OwnedUserId) {
         if status.has_master && status.has_self_signing && status.has_user_signing {
             info!(
                 user_id = %user_id,
-                "Cross-signing already complete — skipping bootstrap"
+                "Cross-signing already complete. Skipping bootstrap"
             );
             return;
         }
@@ -106,7 +106,7 @@ pub async fn bootstrap_cross_signing(client: &Client, user_id: &OwnedUserId) {
             has_master         = status.has_master,
             has_self_signing   = status.has_self_signing,
             has_user_signing   = status.has_user_signing,
-            "Cross-signing incomplete — attempting bootstrap"
+            "Cross-signing incomplete. Attempting bootstrap"
         );
     }
     match client.encryption().bootstrap_cross_signing(None).await {

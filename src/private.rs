@@ -26,7 +26,7 @@ use serde_json::Value;
 
 /// The room version for a new room: the first of `preferred` the server
 /// supports as *stable*, else `None` (= the server's default). Room
-/// version IDs are opaque strings, so "newest" is never computed — the
+/// version IDs are opaque strings, so "newest" is never computed: the
 /// caller lists the versions it has intentionally tested, best first.
 pub fn choose_room_version(
     capability: &RoomVersionsCapability,
@@ -149,7 +149,7 @@ pub async fn is_private_dm(client: &Client, room_id: &RoomId, user: &UserId) -> 
 /// Whether `user` is joined to `room_id` right now, asked of the server
 /// (the bot must be in the room to see it). `Ok(false)` when they have no
 /// membership there at all; an error for anything the server wouldn't
-/// answer — callers treat that as "no".
+/// answer: callers treat that as "no".
 pub async fn is_joined_now(client: &Client, room_id: &RoomId, user: &UserId) -> Result<bool> {
     let request = get_state_event_for_key::v3::Request::new(
         room_id.to_owned(),

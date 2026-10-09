@@ -33,7 +33,7 @@ mxbot_common::logging::init("my_bot");
 
 let bot = Bot::builder("my-bot", env!("CARGO_PKG_VERSION"))
     .settings(settings.store().clone())   // optional runtime settings
-    .admin_help("!mycommand — …")         // optional, listed by `!admin`
+    .admin_help("!mycommand: …")         // optional, listed by `!admin`
     .start(&config.matrix, &config.security)
     .await?;                               // session, verification, invites, admin console
 
@@ -90,7 +90,7 @@ of in shared rooms:
 A message is accepted only if the sender is an admin, the room is the bot's
 direct chat with exactly that admin (the bot's own `m.direct` data, no other
 members), the event was end-to-end encrypted (`require_encryption`, default
-on) and — with `require_verified_device = true` — it came from a device the
+on) and (with `require_verified_device = true`) it came from a device the
 bot has verified. Bot-specific commands (e.g. `!startquiz`) are passed back
 to the bot as `Dispatch::AdminDm` and answered in the direct chat.
 `!reset-trust` / `!verify-device` keep working silently in shared rooms.
@@ -103,12 +103,12 @@ and stored in `store/settings.json`. Secrets never belong in `T`.
 
 ## Other modules
 
-* `format` — `mentionify` & co.: `@user:server` → pill + `m.mentions`,
+* `format`: `mentionify` & co.: `@user:server` → pill + `m.mentions`,
   `**bold**`, `~~strike~~`, `[label](url)`, newlines.
-* `send` — idempotent `send_with_retry`, thread-reply helpers.
-* `persist` — atomic JSON load/save for bot state files.
-* `retry` — `Backoff` with optional jitter.
-* `session` — build a client for secondary accounts.
+* `send`: idempotent `send_with_retry`, thread-reply helpers.
+* `persist`: atomic JSON load/save for bot state files.
+* `retry`: `Backoff` with optional jitter.
+* `session`: build a client for secondary accounts.
 
 ## Developing against a local checkout
 

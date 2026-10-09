@@ -23,7 +23,7 @@ use crate::{
 
 const JOIN_MAX_ATTEMPTS: u32 = 8;
 
-/// Rooms allowed at runtime on top of `[security] allowed_rooms` — rooms an
+/// Rooms allowed at runtime on top of `[security] allowed_rooms`: rooms an
 /// admin authorized through a bot command, say. A shared handle: the bot
 /// updates it, the invite handler reads it. Cheap to clone.
 #[derive(Clone, Debug, Default)]

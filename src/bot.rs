@@ -83,7 +83,7 @@ impl BotBuilder {
 
         let admins = Arc::new(security.admins()?);
         if admins.is_empty() {
-            warn!("No admin_users configured — admin commands are disabled");
+            warn!("No admin_users configured. Admin commands are disabled");
         } else {
             info!(admins = ?admins, "Admin users configured");
         }

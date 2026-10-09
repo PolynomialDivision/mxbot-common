@@ -1,12 +1,12 @@
 //! Shared Matrix infrastructure for the mxbot fleet.
 //!
-//! * [`Bot`] — session restore, verification, invite handling, admin console
+//! * [`Bot`]: session restore, verification, invite handling, admin console
 //!   and the sync loop in a few calls.
-//! * [`format`] / [`send`] — mention-aware messages and idempotent sending.
-//! * [`admin`] — admin commands in direct chats with configured admins.
-//! * [`settings`] / [`persist`] — persisted runtime settings and JSON state.
-//! * [`private`] — private 1:1 chats and fresh membership checks.
-//! * [`matrix_sdk`] — the fleet's (forked) Matrix SDK; bots use this
+//! * [`format`] / [`send`]: mention-aware messages and idempotent sending.
+//! * [`admin`]: admin commands in direct chats with configured admins.
+//! * [`settings`] / [`persist`]: persisted runtime settings and JSON state.
+//! * [`private`]: private 1:1 chats and fresh membership checks.
+//! * [`matrix_sdk`]: the fleet's (forked) Matrix SDK; bots use this
 //!   re-export instead of depending on the SDK themselves.
 
 pub mod admin;

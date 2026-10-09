@@ -173,8 +173,8 @@ impl VerificationService {
 
     /// Construct the standard allowlisted TOFU policy from shared config.
     ///
-    /// Allowed first-time users are `verification.allowed_users`, or — when
-    /// that is empty — an explicit `allowed_inviters` list. Admins are always
+    /// Allowed first-time users are `verification.allowed_users`, or, when
+    /// that is empty: an explicit `allowed_inviters` list. Admins are always
     /// allowed so that they and the bot can verify each other.
     pub fn from_config(
         client: Client,

@@ -2,7 +2,7 @@
 //! has, allow-lists, and helpers for locating/loading the config file.
 //!
 //! Secrets (access token, recovery key) live in the config file or in
-//! environment variables — never in the runtime settings that admins can
+//! environment variables, never in the runtime settings that admins can
 //! change over chat (see [`crate::settings`]).
 
 use std::{
@@ -18,7 +18,7 @@ use matrix_sdk_crypto::CollectStrategy;
 use serde::{de::DeserializeOwned, Deserialize, Deserializer};
 use tracing::warn;
 
-/// Matrix credentials and homeserver — the `[matrix]` table.
+/// Matrix credentials and homeserver: the `[matrix]` table.
 ///
 /// `access_token` and `recovery_key` can be supplied (or overridden) through
 /// the `MATRIX_ACCESS_TOKEN` and `MATRIX_RECOVERY_KEY` environment variables
@@ -222,7 +222,7 @@ impl SecurityConfig {
     }
 }
 
-/// Verification policy — `[security.verification]`.
+/// Verification policy: `[security.verification]`.
 #[derive(Deserialize, Clone, Debug)]
 pub struct VerificationConfig {
     /// Matrix users allowed to verify with the bot. Empty falls back to an
@@ -256,7 +256,7 @@ impl Default for VerificationConfig {
     }
 }
 
-/// Admin direct-chat policy — `[security.admin_dm]`.
+/// Admin direct-chat policy: `[security.admin_dm]`.
 #[derive(Deserialize, Clone, Debug)]
 pub struct AdminDmConfig {
     /// Accept admin commands in direct chats with configured admins.

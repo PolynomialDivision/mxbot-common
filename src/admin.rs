@@ -16,8 +16,8 @@
 //!
 //! Access requires, in this order: the sender is a configured admin; the
 //! room is the bot's direct chat with exactly that admin; the message was
-//! end-to-end encrypted (unless `require_encryption = false`); and — if
-//! `require_verified_device = true` — it was sent from a device the bot has
+//! end-to-end encrypted (unless `require_encryption = false`); and, if
+//! `require_verified_device = true`: it was sent from a device the bot has
 //! verified (from an unverified device only `!admin verify` runs, so the
 //! admin can get verified). `!reset-trust` / `!verify-device` keep working
 //! silently in shared rooms for compatibility.
@@ -177,9 +177,7 @@ impl AdminConsole {
         if self.inner.policy.require_encryption
             && (encryption.is_none() || !room.encryption_state().is_encrypted())
         {
-            return Access::Denied(
-                "admin commands need an end-to-end encrypted chat — enable encryption here or start a new encrypted direct chat",
-            );
+            return Access::Denied("Enable encryption here or start a new encrypted direct chat");
         }
         if self.inner.policy.require_verified_device {
             match encryption.map(|info| &info.verification_state) {
@@ -201,7 +199,7 @@ impl AdminConsole {
     /// arrived and never re-checks `SenderUnverified` keys
     /// (`SenderData::should_recalculate`). Messages from a session the admin's
     /// client set up before we verified each other keep saying "unverified
-    /// identity" until the client rotates it — which can take a week. The
+    /// identity" until the client rotates it, which can take a week. The
     /// key's sender device is still known for such messages, so ask about it
     /// afresh: cross-signed by its owner, and the owner verified by us (what
     /// `Verified` would mean), with no identity change in between.
@@ -256,12 +254,20 @@ impl AdminConsole {
             Access::Unverified(reason) => {
                 let device = encryption.and_then(|info| info.sender_device.as_deref());
                 warn!(user_id = %sender, device_id = ?device, room_id = %room.room_id(), reason, "Refusing admin command");
-                self.reply(room, format!("⛔ {reason}.")).await;
+                self.reply(
+                    room,
+                    format!("⛔ Admin commands need a verified device.\n🔐 {reason}."),
+                )
+                .await;
                 Dispatch::Handled
             }
             Access::Denied(reason) => {
                 warn!(user_id = %sender, room_id = %room.room_id(), reason, "Refusing admin command");
-                self.reply(room, format!("⛔ {reason}.")).await;
+                self.reply(
+                    room,
+                    format!("⛔ Admin commands need an end-to-end encrypted chat.\n🔐 {reason}."),
+                )
+                .await;
                 Dispatch::Handled
             }
             Access::None => match command {
@@ -280,8 +286,7 @@ impl AdminConsole {
                     if self.is_admin(sender) {
                         self.reply(
                             room,
-                            "🔒 Admin commands are only available in a direct chat with me."
-                                .to_owned(),
+                            "🔒 Admin commands only work in a direct chat with me.".to_owned(),
                         )
                         .await;
                     }
@@ -305,9 +310,9 @@ impl AdminConsole {
             Command::Help => self.help(),
             Command::Status => self.status(sender).await,
             Command::Verify => match verification.trust_summary(sender).await {
-                "verified" => "✅ You and I are already verified. To re-verify (e.g. after resetting your identity) run `!reset-trust` for yourself first.".to_owned(),
+                "verified" => "✅ You and I are already verified.\n🔁 To verify again (e.g. after resetting your identity), run !reset-trust for yourself first.".to_owned(),
                 _ => match verification.request_user_verification(sender).await {
-                    Ok(()) => "🔐 Verification request sent — accept it in your client and compare the emojis.".to_owned(),
+                    Ok(()) => "🔐 Verification request sent.\n👉 Accept it in your client and compare the emojis.".to_owned(),
                     Err(error) => format!("❌ Could not start verification: {error}"),
                 },
             },
@@ -315,12 +320,12 @@ impl AdminConsole {
                 Some(settings) => {
                     let described = settings.describe();
                     if described.is_empty() {
-                        "This bot has no runtime settings.".to_owned()
+                        "🤷 This bot has no runtime settings.".to_owned()
                     } else {
-                        format!("Runtime settings:\n{described}")
+                        format!("⚙️ Runtime settings\n{described}")
                     }
                 }
-                None => "This bot has no runtime settings.".to_owned(),
+                None => "🤷 This bot has no runtime settings.".to_owned(),
             },
             Command::Set(key, value) => match &self.inner.settings {
                 Some(settings) => match settings.set(&key, &value).await {
@@ -330,17 +335,17 @@ impl AdminConsole {
                     }
                     Err(error) => format!("❌ {error}"),
                 },
-                None => "This bot has no runtime settings.".to_owned(),
+                None => "🤷 This bot has no runtime settings.".to_owned(),
             },
             Command::Unset(key) => match &self.inner.settings {
                 Some(settings) => match settings.unset(&key).await {
                     Ok(value) => {
                         info!(admin_user_id = %sender, key, "Runtime setting reset");
-                        format!("✅ {key} reverted to the configured value ({value})")
+                        format!("↩️ {key} is back to the configured value ({value})")
                     }
                     Err(error) => format!("❌ {error}"),
                 },
-                None => "This bot has no runtime settings.".to_owned(),
+                None => "🤷 This bot has no runtime settings.".to_owned(),
             },
             Command::ResetTrust(user_id) => {
                 verification.grant_user(user_id.clone()).await;
@@ -360,24 +365,25 @@ impl AdminConsole {
                     }
                 }
             }
-            Command::Invalid(reason) => format!("❌ {reason}. Send !admin for help."),
+            Command::Invalid(reason) => format!("❌ {reason}.\n❔ Send !admin for help."),
         }
     }
 
     fn help(&self) -> String {
         let mut text = format!(
-            "{} admin commands:\n\
-             !admin status — bot, session and trust status\n\
-             !admin verify — verify each other (emoji SAS)\n\
-             !admin settings — show runtime settings\n\
-             !admin set <key> <value> — change a runtime setting\n\
-             !admin unset <key> — revert a setting to the config file\n\
-             !reset-trust <user> — allow one re-verification of <user>\n\
-             !verify-device <user> <device> — verify a specific device",
+            "🛠️ {} admin\n\
+             \n\
+             📊 !admin status: health and trust\n\
+             🔐 !admin verify: verify each other\n\
+             ⚙️ !admin settings: show settings\n\
+             ✏️ !admin set <key> <value>\n\
+             ↩️ !admin unset <key>: back to the config\n\
+             🔁 !reset-trust <user>: allow one new verification\n\
+             📱 !verify-device <user> <device>",
             self.inner.bot_name
         );
         if let Some(help) = &self.inner.help {
-            text.push_str("\n\nBot commands (also usable here):\n");
+            text.push_str("\n\n🤖 Bot commands (also usable here):\n");
             text.push_str(help);
         }
         text
@@ -396,14 +402,15 @@ impl AdminConsole {
             _ => false,
         };
         format!(
-            "{} {}\n\
-             Account: {} (device {})\n\
-             Uptime: {}h {:02}m\n\
-             Joined rooms: {}\n\
-             Cross-signing: {cross_signing}, this device {}\n\
-             You: {}\n\
-             Admins: {}\n\
-             Admin chats: encryption {}, verified device {}",
+            "🤖 {} {}\n\
+             👤 {}\n\
+             📱 Device {}\n\
+             ⏱️ Uptime: {}h {:02}m\n\
+             🏠 Joined rooms: {}\n\
+             ✍️ Cross-signing: {cross_signing}, this device {}\n\
+             🔐 You: {}\n\
+             👑 Admins: {}\n\
+             🔒 Admin chats: encryption {}, verified device {}",
             self.inner.bot_name,
             self.inner.version,
             client
@@ -491,23 +498,23 @@ fn parse_reset_trust<'a>(mut parts: impl Iterator<Item = &'a str>) -> Command {
 fn unverified_reason(level: Option<&VerificationLevel>) -> &'static str {
     match level {
         Some(VerificationLevel::UnverifiedIdentity) => {
-            "admin commands need a verified device — you and I aren't verified yet: run !admin verify"
+            "You and I aren't verified yet. Run !admin verify"
         }
         Some(VerificationLevel::VerificationViolation) => {
-            "admin commands need a verified device — your identity changed since we verified; another admin can allow a re-verification with !reset-trust <you>"
+            "Your identity changed since we verified. Another admin can allow a new verification with !reset-trust <you>"
         }
         Some(VerificationLevel::UnsignedDevice) => {
-            "admin commands need a verified device — you and I are verified, but this session isn't verified by you: verify it with one of your other sessions or your recovery key (Element: Settings → Sessions)"
+            "You and I are verified, but you haven't verified this session. Verify it with another session or your recovery key (Element: Settings → Sessions)"
         }
         Some(VerificationLevel::None(_)) => {
-            "admin commands need a verified device — I don't know the session this came from (yet): send it again in a minute; if that doesn't help, verify this session with your other sessions"
+            "I don't know the session this came from yet. Send it again in a minute. If that doesn't help, verify this session with your other sessions"
         }
-        _ => "admin commands need a verified device — verify this session with the bot (!admin verify) or with your other sessions",
+        _ => "Verify this session with me (!admin verify) or with your other sessions",
     }
 }
 
 /// What an admin may run from a device the bot hasn't verified yet: only
-/// starting the verification itself. It changes no trust on its own — the
+/// starting the verification itself. It changes no trust on its own: the
 /// first verification of an admin is trust on first use (as when the admin
 /// starts it from their client), and re-verifying needs `!reset-trust`.
 fn runs_from_unverified_device(command: &Command) -> bool {
@@ -571,11 +578,11 @@ mod tests {
                 .contains("!admin verify")
         );
         assert!(unverified_reason(Some(&VerificationLevel::UnsignedDevice))
-            .contains("this session isn't verified by you"));
+            .contains("you haven't verified this session"));
         assert!(unverified_reason(Some(&VerificationLevel::None(
             DeviceLinkProblem::MissingDevice
         )))
-        .contains("send it again"));
+        .contains("Send it again"));
         assert!(unverified_reason(None).contains("!admin verify"));
     }
 

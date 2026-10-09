@@ -59,8 +59,8 @@ where
     T: Serialize + DeserializeOwned + 'static,
 {
     /// Load persisted overrides from `path` on top of `defaults` (normally
-    /// taken from the config file). Overrides that no longer validate —
-    /// e.g. after a field was renamed — are dropped with a warning.
+    /// taken from the config file). Overrides that no longer validate:
+    /// e.g. after a field was renamed: are dropped with a warning.
     pub async fn load(path: PathBuf, defaults: T) -> Result<Self> {
         let defaults = serde_json::to_value(&defaults).context("Serializing default settings")?;
         if !defaults.is_object() {
