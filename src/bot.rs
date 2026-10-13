@@ -68,6 +68,8 @@ impl BotBuilder {
     ///
     /// Call before the first sync so no startup events are missed.
     pub async fn start(self, matrix: &MatrixConfig, security: &SecurityConfig) -> Result<Bot> {
+        // Fail closed: a forgotten allow-list must not open the bot up.
+        security.validate()?;
         let mut matrix = matrix.clone();
         matrix.apply_env_overrides();
 
@@ -92,6 +94,13 @@ impl BotBuilder {
             rooms = %security.allowed_rooms.describe(),
             "Invite policy"
         );
+        let dm_rooms = Arc::new(security.dm_rooms()?);
+        if !dm_rooms.is_empty() {
+            info!(
+                rooms = dm_rooms.len(),
+                "Members of dm_rooms may open private chats"
+            );
+        }
 
         let verification = VerificationService::from_config(
             client.clone(),
@@ -109,6 +118,7 @@ impl BotBuilder {
             rooms: security.allowed_rooms.clone(),
             dynamic_rooms: self.dynamic_rooms,
             admins: Arc::clone(&admins),
+            dm_rooms: Arc::clone(&dm_rooms),
         };
         rooms::install_invite_handler(&client, invites.clone());
 
@@ -186,6 +196,25 @@ impl Bot {
             () = sync::shutdown_signal() => {}
         }
         Ok(())
+    }
+
+    /// Whether `room` is `user`'s private chat with the bot and `user` is a
+    /// member of a `[security] dm_rooms` room right now: both asked of the
+    /// server, any error means no. For handlers that serve such chats.
+    pub async fn is_member_dm(&self, room: &Room, user: &UserId) -> bool {
+        for trusted in self.invites.dm_rooms.iter() {
+            if crate::private::is_private_chat_of_member(
+                &self.client,
+                room.room_id(),
+                trusted,
+                user,
+            )
+            .await
+            {
+                return true;
+            }
+        }
+        false
     }
 
     /// Joined rooms for broadcast posts: allowed rooms, without admin

@@ -71,6 +71,9 @@ pub struct InvitePolicy {
     /// Admins may always invite the bot, and their direct chats bypass the
     /// room allow-list (their room IDs cannot be known in advance).
     pub admins: Arc<HashSet<OwnedUserId>>,
+    /// Members of these rooms may open a direct chat with the bot
+    /// (`[security] dm_rooms`).
+    pub dm_rooms: Arc<Vec<OwnedRoomId>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -165,6 +168,20 @@ pub async fn join_with_retry(client: &Client, room_id: &RoomId, inviter: Option<
     false
 }
 
+/// Whether `user` is joined to one of `rooms` right now (asked of the
+/// server).
+pub async fn member_of_any(client: &Client, rooms: &[OwnedRoomId], user: &UserId) -> bool {
+    for room in rooms {
+        if matches!(
+            crate::private::is_joined_now(client, room, user).await,
+            Ok(true)
+        ) {
+            return true;
+        }
+    }
+    false
+}
+
 async fn handle_invite(
     client: Client,
     room: Room,
@@ -173,17 +190,34 @@ async fn handle_invite(
     is_direct: bool,
 ) {
     let room_id = room.room_id().to_owned();
-    match policy.decide(inviter.as_deref(), &room_id, is_direct) {
-        InviteDecision::Accept => {
-            info!(room_id = %room_id, inviter = ?inviter, is_direct, "Accepting invite");
-            join_with_retry(&client, &room_id, inviter.as_deref()).await;
-        }
-        decision => {
-            warn!(room_id = %room_id, inviter = ?inviter, ?decision, "Rejecting invite");
-            if let Err(error) = room.leave().await {
-                warn!(room_id = %room_id, %error, "Failed to reject invite");
+    let decision = policy.decide(inviter.as_deref(), &room_id, is_direct);
+    if decision == InviteDecision::Accept {
+        info!(room_id = %room_id, inviter = ?inviter, is_direct, "Accepting invite");
+        join_with_retry(&client, &room_id, inviter.as_deref()).await;
+        return;
+    }
+    // A direct chat from a member of a `dm_rooms` room: join, then make sure
+    // it is really just the two of them, encrypted; otherwise leave again.
+    if let Some(member) = inviter
+        .as_deref()
+        .filter(|_| is_direct && !policy.dm_rooms.is_empty())
+    {
+        if member_of_any(&client, &policy.dm_rooms, member).await {
+            info!(room_id = %room_id, inviter = %member, "Accepting a direct chat from a member");
+            if join_with_retry(&client, &room_id, Some(member)).await
+                && !crate::private::is_private_dm(&client, &room_id, member).await
+            {
+                warn!(room_id = %room_id, inviter = %member, "Direct chat is not private; leaving");
+                if let Err(error) = room.leave().await {
+                    warn!(room_id = %room_id, %error, "Failed to leave a non-private chat");
+                }
             }
+            return;
         }
+    }
+    warn!(room_id = %room_id, inviter = ?inviter, ?decision, "Rejecting invite");
+    if let Err(error) = room.leave().await {
+        warn!(room_id = %room_id, %error, "Failed to reject invite");
     }
 }
 
@@ -251,7 +285,8 @@ pub fn admin_dm_partner(room: &Room, admins: &HashSet<OwnedUserId>) -> Option<Ow
 }
 
 /// Joined rooms that should receive the bot's broadcast posts: those allowed
-/// by `rooms`, minus admin direct chats unless `include_admin_dms`.
+/// by `rooms`, never a direct chat (members' private chats included), and
+/// admin direct chats only with `include_admin_dms`.
 pub fn broadcast_rooms(
     client: &Client,
     rooms: &RoomAllowList,
@@ -262,7 +297,10 @@ pub fn broadcast_rooms(
         .joined_rooms()
         .into_iter()
         .filter(|room| rooms.allows(room.room_id()))
-        .filter(|room| include_admin_dms || admin_dm_partner(room, admins).is_none())
+        .filter(|room| {
+            let direct = room.direct_targets_length() == 1 && room.active_members_count() <= 2;
+            !direct || (include_admin_dms && admin_dm_partner(room, admins).is_some())
+        })
         .collect()
 }
 
@@ -284,6 +322,7 @@ mod tests {
             rooms,
             dynamic_rooms: DynamicRooms::default(),
             admins: Arc::new(HashSet::from([user_id!("@admin:example.org").to_owned()])),
+            dm_rooms: Arc::default(),
         }
     }
 
@@ -340,6 +379,21 @@ mod tests {
             policy(only, RoomAllowList::All).decide(None, room, false),
             InviteDecision::RejectInviter
         );
+    }
+
+    #[test]
+    fn an_unset_list_allows_nobody() {
+        let room = room_id!("!room:example.org");
+        let p = policy(UserAllowList::Unset, RoomAllowList::Unset);
+        assert_eq!(
+            p.decide(Some(user_id!("@alice:example.org")), room, false),
+            InviteDecision::RejectInviter
+        );
+        assert_eq!(p.decide(None, room, false), InviteDecision::RejectInviter);
+        // Admins: their direct chats still work, rooms need the list.
+        let admin = Some(user_id!("@admin:example.org"));
+        assert_eq!(p.decide(admin, room, true), InviteDecision::Accept);
+        assert_eq!(p.decide(admin, room, false), InviteDecision::RejectRoom);
     }
 
     #[test]

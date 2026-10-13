@@ -76,11 +76,15 @@ impl From<EncryptionStrategy> for CollectStrategy {
 
 /// An allow-list written as either the string `"all"` or a list of IDs.
 ///
-/// An omitted list allows everything; an explicit empty list (`[]`) allows
-/// nothing.
+/// Only an explicit `"all"` allows everything; an empty list (`[]`)
+/// allows nothing. An omitted list is [`AllowList::Unset`]: it allows
+/// nothing, and [`SecurityConfig::validate`] (run by `Bot::start`) refuses
+/// it, so a forgotten entry never opens the bot up.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum AllowList<T: Eq + Hash> {
+    /// Not configured.
     #[default]
+    Unset,
     All,
     Only(HashSet<T>),
 }
@@ -93,14 +97,20 @@ impl<T: Eq + Hash> AllowList<T> {
         matches!(self, Self::All)
     }
 
+    /// Allows nobody: an empty list, or not configured.
     pub fn is_none(&self) -> bool {
-        matches!(self, Self::Only(set) if set.is_empty())
+        matches!(self, Self::Unset) || matches!(self, Self::Only(set) if set.is_empty())
+    }
+
+    /// Configured at all (`"all"` or a list, also an empty one).
+    pub fn is_set(&self) -> bool {
+        !matches!(self, Self::Unset)
     }
 
     /// The explicit entries, empty for `"all"`.
     pub fn entries(&self) -> impl Iterator<Item = &T> {
         let set = match self {
-            Self::All => None,
+            Self::Unset | Self::All => None,
             Self::Only(set) => Some(set),
         };
         set.into_iter().flatten()
@@ -111,6 +121,7 @@ impl<T: Eq + Hash> AllowList<T> {
         T: std::fmt::Display,
     {
         match self {
+            Self::Unset => "not set (nobody)".to_owned(),
             Self::All => "everyone".to_owned(),
             Self::Only(set) if set.is_empty() => "nobody".to_owned(),
             Self::Only(set) => {
@@ -125,6 +136,7 @@ impl<T: Eq + Hash> AllowList<T> {
 impl UserAllowList {
     pub fn allows(&self, user_id: &UserId) -> bool {
         match self {
+            Self::Unset => false,
             Self::All => true,
             Self::Only(set) => set.contains(user_id),
         }
@@ -134,6 +146,7 @@ impl UserAllowList {
 impl RoomAllowList {
     pub fn allows(&self, room_id: &RoomId) -> bool {
         match self {
+            Self::Unset => false,
             Self::All => true,
             Self::Only(set) => set.contains(room_id),
         }
@@ -191,12 +204,20 @@ fn default_true() -> bool {
 pub struct SecurityConfig {
     /// Users allowed to invite the bot into rooms (`"all"` or a list).
     /// Configured admins may always invite the bot into a direct chat.
+    /// Required: an omitted entry stops the bot at startup.
     #[serde(default)]
     pub allowed_inviters: UserAllowList,
     /// Rooms the bot is allowed to join (`"all"` or a list). Direct chats
-    /// opened by an admin are always allowed.
+    /// opened by an admin are always allowed. Required like
+    /// `allowed_inviters`.
     #[serde(default)]
     pub allowed_rooms: RoomAllowList,
+    /// Rooms whose members may open a private chat with the bot: a direct
+    /// chat invite from someone joined to one of these rooms right now is
+    /// accepted, and the bot leaves again unless the chat turns out to be
+    /// just the two of them, encrypted.
+    #[serde(default)]
+    pub dm_rooms: Vec<String>,
     /// Users allowed to run administrative commands.
     #[serde(default)]
     pub admin_users: Vec<String>,
@@ -209,6 +230,37 @@ pub struct SecurityConfig {
 }
 
 impl SecurityConfig {
+    /// Refuse a configuration that would silently open the bot up: both
+    /// allow-lists must be set (to a list or to `"all"`), and `dm_rooms`
+    /// must hold valid room IDs.
+    pub fn validate(&self) -> Result<()> {
+        if !self.allowed_inviters.is_set() {
+            bail!(
+                "[security] allowed_inviters is not set: list the users who may invite the bot \
+                 (admins always may), [] for nobody, or \"all\" for everyone"
+            );
+        }
+        if !self.allowed_rooms.is_set() {
+            bail!(
+                "[security] allowed_rooms is not set: list the room IDs the bot may join, \
+                 [] for none, or \"all\" to allow every room"
+            );
+        }
+        self.dm_rooms()?;
+        Ok(())
+    }
+
+    /// `dm_rooms`, parsed.
+    pub fn dm_rooms(&self) -> Result<Vec<OwnedRoomId>> {
+        self.dm_rooms
+            .iter()
+            .map(|room| {
+                room.parse()
+                    .with_context(|| format!("Invalid room ID in dm_rooms: {room:?}"))
+            })
+            .collect()
+    }
+
     /// Parse `admin_users`; invalid entries are an error rather than being
     /// silently dropped, since they gate privileged access.
     pub fn admins(&self) -> Result<HashSet<OwnedUserId>> {
@@ -386,6 +438,32 @@ pub fn parse_hh_mm(value: &str) -> Result<(u32, u32)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn omitted_allow_lists_are_unset_and_refused() {
+        let unset: SecurityConfig = toml::from_str("").unwrap();
+        assert!(!unset.allowed_rooms.is_set() && unset.allowed_rooms.is_none());
+        assert!(unset.validate().is_err());
+        let one: SecurityConfig = toml::from_str("allowed_inviters = []").unwrap();
+        assert!(one
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("allowed_rooms"));
+        let ok: SecurityConfig =
+            toml::from_str("allowed_inviters = []\nallowed_rooms = \"all\"").unwrap();
+        assert!(ok.validate().is_ok() && ok.allowed_rooms.is_all());
+        let bad_dm: SecurityConfig = toml::from_str(
+            "allowed_inviters = []\nallowed_rooms = []\ndm_rooms = [\"not a room\"]",
+        )
+        .unwrap();
+        assert!(bad_dm.validate().is_err());
+        let dm: SecurityConfig = toml::from_str(
+            "allowed_inviters = []\nallowed_rooms = []\ndm_rooms = [\"!house:example.org\"]",
+        )
+        .unwrap();
+        assert_eq!(dm.dm_rooms().unwrap().len(), 1);
+    }
+
     use super::*;
     use matrix_sdk::ruma::user_id;
 
@@ -406,10 +484,14 @@ mod tests {
     }
 
     #[test]
-    fn allow_lists_accept_all_keyword_lists_and_default_to_all() {
+    fn allow_lists_accept_all_keyword_lists_and_omitted_allows_nobody() {
         let omitted: Wrapper = toml::from_str("").unwrap();
-        assert!(omitted.security.allowed_inviters.is_all());
-        assert!(omitted.security.allowed_rooms.is_all());
+        assert!(!omitted.security.allowed_inviters.is_all());
+        assert!(!omitted
+            .security
+            .allowed_inviters
+            .allows(user_id!("@alice:example.org")));
+        assert!(!omitted.security.allowed_rooms.is_set());
 
         let all: Wrapper = toml::from_str("[security]\nallowed_inviters = \"all\"").unwrap();
         assert!(all.security.allowed_inviters.is_all());

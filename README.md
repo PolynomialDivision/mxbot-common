@@ -55,21 +55,28 @@ move |ev: OriginalSyncRoomMessageEvent, room: Room, encryption: Option<Encryptio
 ```
 
 Broadcasting bots post to `bot.broadcast_rooms()`: joined rooms allowed by
-`allowed_rooms`, without admin direct chats.
+`allowed_rooms`, never into direct chats (admin direct chats only with
+`receive_broadcasts`).
 
 ## Configuration (`[matrix]` / `[security]`)
 
 | Key | Meaning |
 | --- | --- |
 | `matrix.access_token`, `matrix.recovery_key` | May instead be set via `MATRIX_ACCESS_TOKEN` / `MATRIX_RECOVERY_KEY`. |
-| `security.allowed_inviters` | `"all"` or a list of user IDs; `[]` allows nobody. Omitted = everyone. |
-| `security.allowed_rooms` | `"all"` or a list of room IDs the bot may join and post to. |
+| `security.allowed_inviters` | **Required.** `"all"` or a list of user IDs; `[]` allows nobody. Omitted = the bot refuses to start. |
+| `security.allowed_rooms` | **Required.** `"all"` or a list of room IDs the bot may join and post to; `[]` for none. Omitted = the bot refuses to start. |
+| `security.dm_rooms` | Rooms whose current members may open a private chat with the bot (direct invite; the bot leaves unless it is just the two of them, encrypted). Bots check such chats with `bot.is_member_dm(&room, &user)`. |
 | `security.admin_users` | Admins. Invalid IDs are a startup error. |
 | `security.encryption_strategy` | `identity_based` (default), `only_trusted`, `all_devices`. |
 | `security.verification.*` | Who may verify with the bot (admins always may), flow limits. |
 | `security.admin_dm.*` | Admin direct-chat policy, see below. |
 
 `STORE_PATH` (default `store`) holds the SDK stores and the bot's own files.
+
+`MXBOT_HEARTBEAT_FILE` (optional) names a file that gets the current Unix
+time after every successful sync, for container health checks such as
+`f="$MXBOT_HEARTBEAT_FILE"; [ -f "$f" ] && [ $(( $(date +%s) - $(cat "$f") )) -lt 120 ]`.
+Unset, nothing is written.
 
 ## Admin direct chats
 
@@ -105,7 +112,13 @@ and stored in `store/settings.json`. Secrets never belong in `T`.
 
 * `format`: `mentionify` & co.: `@user:server` → pill + `m.mentions`,
   `**bold**`, `~~strike~~`, `[label](url)`, newlines.
-* `send`: idempotent `send_with_retry`, thread-reply helpers.
+* `send`: idempotent `send_with_retry`, and `send_with_retry_txn` /
+  `send_raw_with_retry_txn` with a transaction ID the bot stores itself
+  (retry the same logical message after a restart); thread-reply helpers.
+* `private`: encrypted 1:1 chats the bot creates (`create_private_dm`,
+  `PREFERRED_ROOM_VERSIONS`), fresh checks asked of the server
+  (`is_private_dm`, `is_joined_now`, and `is_private_chat_of_member`:
+  joined to the main room and the chat still just the bot and them).
 * `persist`: atomic JSON load/save for bot state files.
 * `retry`: `Backoff` with optional jitter.
 * `session`: build a client for secondary accounts.

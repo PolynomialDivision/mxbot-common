@@ -61,16 +61,63 @@ pub async fn send_with_retry<C>(room: &Room, content: C) -> Result<OwnedEventId,
 where
     C: MessageLikeEventContent + Clone,
 {
-    let txn_id = TransactionId::new();
+    send_with_retry_txn(room, content, &TransactionId::new()).await
+}
+
+/// [`send_with_retry`] with a transaction ID chosen (and stored) by the
+/// caller: a bot that records the ID before sending can retry the same
+/// logical message after a restart without posting it twice, as long as
+/// the homeserver still remembers the ID. Never reuse an ID for a
+/// different message.
+pub async fn send_with_retry_txn<C>(
+    room: &Room,
+    content: C,
+    txn_id: &TransactionId,
+) -> Result<OwnedEventId, matrix_sdk::Error>
+where
+    C: MessageLikeEventContent + Clone,
+{
+    retry_send(room, || async {
+        room.send(content.clone())
+            .with_transaction_id(txn_id.to_owned())
+            .await
+            .map(|response| response.response.event_id)
+    })
+    .await
+}
+
+/// [`send_with_retry_txn`] for raw JSON content, e.g. a message that
+/// carries an extra field of the bot's own.
+pub async fn send_raw_with_retry_txn(
+    room: &Room,
+    event_type: &str,
+    content: serde_json::Value,
+    txn_id: &TransactionId,
+) -> Result<OwnedEventId, matrix_sdk::Error> {
+    retry_send(room, || async {
+        room.send_raw(event_type, content.clone())
+            .with_transaction_id(txn_id)
+            .await
+            .map(|response| response.response.event_id)
+    })
+    .await
+}
+
+/// Run one send attempt after another until it succeeds, fails
+/// permanently, or [`MAX_ATTEMPTS`] are used up.
+async fn retry_send<F, Fut>(
+    room: &Room,
+    mut attempt_send: F,
+) -> Result<OwnedEventId, matrix_sdk::Error>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<OwnedEventId, matrix_sdk::Error>>,
+{
     let mut backoff = Backoff::new(INITIAL_BACKOFF, MAX_BACKOFF);
     let mut attempt = 1;
     loop {
-        match room
-            .send(content.clone())
-            .with_transaction_id(txn_id.clone())
-            .await
-        {
-            Ok(response) => return Ok(response.response.event_id),
+        match attempt_send().await {
+            Ok(event_id) => return Ok(event_id),
             Err(error) => {
                 let (retryable, retry_after) = classify_send_error(&error);
                 if !retryable || attempt >= MAX_ATTEMPTS {

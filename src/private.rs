@@ -24,6 +24,10 @@ use matrix_sdk::{
 };
 use serde_json::Value;
 
+/// Room versions the fleet has tested for new private chats, best first.
+pub const PREFERRED_ROOM_VERSIONS: [RoomVersionId; 3] =
+    [RoomVersionId::V12, RoomVersionId::V11, RoomVersionId::V10];
+
 /// The room version for a new room: the first of `preferred` the server
 /// supports as *stable*, else `None` (= the server's default). Room
 /// version IDs are opaque strings, so "newest" is never computed: the
@@ -144,6 +148,22 @@ pub async fn is_private_dm(client: &Client, room_id: &RoomId, user: &UserId) -> 
         .filter_map(|e| e.deserialize_as::<Value>().ok())
         .collect();
     is_private_state(&events, bot.as_str(), user.as_str())
+}
+
+/// Whether `chat_room` may be used as `user`'s private chat with the bot
+/// right now: `user` is joined to `trusted_room` (the bot's main room)
+/// and `chat_room` is still exactly the bot and `user`, joined and
+/// encrypted ([`is_private_dm`]). Both asked of the server; any error
+/// means no.
+pub async fn is_private_chat_of_member(
+    client: &Client,
+    chat_room: &RoomId,
+    trusted_room: &RoomId,
+    user: &UserId,
+) -> bool {
+    chat_room != trusted_room
+        && matches!(is_joined_now(client, trusted_room, user).await, Ok(true))
+        && is_private_dm(client, chat_room, user).await
 }
 
 /// Whether `user` is joined to `room_id` right now, asked of the server

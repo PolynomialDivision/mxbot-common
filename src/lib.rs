@@ -8,11 +8,13 @@
 //! * [`private`]: private 1:1 chats and fresh membership checks.
 //! * [`matrix_sdk`]: the fleet's (forked) Matrix SDK; bots use this
 //!   re-export instead of depending on the SDK themselves.
+//! * [`heartbeat`]: optional liveness file for container health checks.
 
 pub mod admin;
 mod bot;
 pub mod config;
 pub mod format;
+pub mod heartbeat;
 pub mod logging;
 pub mod persist;
 pub mod private;
