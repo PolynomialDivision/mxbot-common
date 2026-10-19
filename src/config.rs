@@ -74,6 +74,20 @@ impl From<EncryptionStrategy> for CollectStrategy {
     }
 }
 
+/// Whose devices count (`[security] trust`), see [`crate::trust`].
+#[derive(Deserialize, Default, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Trust {
+    /// Verified with the bot (`!admin verify`). A new identity (someone
+    /// reset their keys) stops everything until they verify again.
+    #[default]
+    Verified,
+    /// Every device a person signed with their current identity. A new
+    /// identity is accepted (and logged); a device they never signed still
+    /// counts for nothing.
+    CrossSigned,
+}
+
 /// An allow-list written as either the string `"all"` or a list of IDs.
 ///
 /// Only an explicit `"all"` allows everything; an empty list (`[]`)
@@ -224,6 +238,8 @@ pub struct SecurityConfig {
     #[serde(default)]
     pub encryption_strategy: EncryptionStrategy,
     #[serde(default)]
+    pub trust: Trust,
+    #[serde(default)]
     pub verification: VerificationConfig,
     #[serde(default)]
     pub admin_dm: AdminDmConfig,
@@ -317,9 +333,10 @@ pub struct AdminDmConfig {
     /// Only accept commands in end-to-end encrypted direct chats.
     #[serde(default = "default_true")]
     pub require_encryption: bool,
-    /// Only accept commands sent from a device the bot has verified
-    /// (cross-signed by a verified identity). Recommended once the admin and
-    /// the bot have verified each other (`!verify`).
+    /// Only accept commands sent from a device that counts under
+    /// `[security] trust`: cross-signed by an identity the bot verified
+    /// (`verified`, after `!admin verify`), or by the admin's current
+    /// identity (`cross_signed`).
     #[serde(default)]
     pub require_verified_device: bool,
     /// Also deliver the bot's broadcast posts (digests, reminders, …) into
@@ -519,6 +536,15 @@ mod tests {
     fn allow_lists_reject_garbage() {
         assert!(toml::from_str::<Wrapper>("[security]\nallowed_inviters = \"some\"").is_err());
         assert!(toml::from_str::<Wrapper>("[security]\nallowed_rooms = [\"not-a-room\"]").is_err());
+    }
+
+    #[test]
+    fn trust_stays_verified_unless_cross_signed_is_chosen() {
+        let default: SecurityConfig = toml::from_str("").unwrap();
+        assert_eq!(default.trust, Trust::Verified);
+        let chosen: SecurityConfig = toml::from_str("trust = \"cross_signed\"").unwrap();
+        assert_eq!(chosen.trust, Trust::CrossSigned);
+        assert!(toml::from_str::<SecurityConfig>("trust = \"anyone\"").is_err());
     }
 
     #[test]

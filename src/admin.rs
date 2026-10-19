@@ -40,7 +40,9 @@ use matrix_sdk::{
 use tracing::{info, warn};
 
 use crate::{
-    config::AdminDmConfig, rooms::admin_dm_partner, settings::SettingsStore,
+    config::{AdminDmConfig, Trust},
+    rooms::admin_dm_partner,
+    settings::SettingsStore,
     verify::VerificationService,
 };
 
@@ -97,6 +99,7 @@ struct Inner {
     version: String,
     admins: Arc<HashSet<OwnedUserId>>,
     policy: AdminDmConfig,
+    trust: Trust,
     verification: VerificationService,
     settings: Option<SettingsStore>,
     help: Option<String>,
@@ -130,6 +133,7 @@ impl AdminConsole {
         version: String,
         admins: Arc<HashSet<OwnedUserId>>,
         policy: AdminDmConfig,
+        trust: Trust,
         verification: VerificationService,
         settings: Option<SettingsStore>,
         help: Option<String>,
@@ -141,6 +145,7 @@ impl AdminConsole {
                 version,
                 admins,
                 policy,
+                trust,
                 verification,
                 settings,
                 help,
@@ -180,43 +185,52 @@ impl AdminConsole {
             return Access::Denied("Enable encryption here or start a new encrypted direct chat");
         }
         if self.inner.policy.require_verified_device {
+            let trust = self.inner.trust;
             match encryption.map(|info| &info.verification_state) {
                 Some(VerificationState::Verified) => {}
-                Some(VerificationState::Unverified(VerificationLevel::UnverifiedIdentity))
-                    if self.verified_since(sender, encryption).await => {}
+                Some(VerificationState::Unverified(
+                    VerificationLevel::UnverifiedIdentity
+                    | VerificationLevel::VerificationViolation,
+                )) if self.counts_now(sender, encryption).await => {}
                 Some(VerificationState::Unverified(level)) => {
-                    return Access::Unverified(unverified_reason(Some(level)))
+                    return Access::Unverified(unverified_reason(trust, Some(level)))
                 }
-                None => return Access::Unverified(unverified_reason(None)),
+                None => return Access::Unverified(unverified_reason(trust, None)),
             }
         }
         Access::Granted
     }
 
-    /// Whether the device a message came from is verified *now*.
+    /// Whether the device a message came from counts under `trust` *now*.
     ///
     /// matrix-sdk stores how trusted a room key's sender was when the key
     /// arrived and never re-checks `SenderUnverified` keys
     /// (`SenderData::should_recalculate`). Messages from a session the admin's
     /// client set up before we verified each other keep saying "unverified
-    /// identity" until the client rotates it, which can take a week. The
-    /// key's sender device is still known for such messages, so ask about it
-    /// afresh: cross-signed by its owner, and the owner verified by us (what
-    /// `Verified` would mean), with no identity change in between.
-    async fn verified_since(&self, sender: &UserId, encryption: Option<&EncryptionInfo>) -> bool {
+    /// identity" until the client rotates it, which can take a week (and
+    /// "verification violation" after a new identity was accepted). The key's
+    /// sender device is still known for such messages, so ask about it
+    /// afresh: cross-signed by its owner, and (`verified`) the owner verified
+    /// by us, with no identity change in between.
+    async fn counts_now(&self, sender: &UserId, encryption: Option<&EncryptionInfo>) -> bool {
         let Some(device_id) = encryption.and_then(|info| info.sender_device.as_deref()) else {
             return false;
         };
         let encryption = self.inner.client.encryption();
-        let identity_ok = matches!(
-            encryption.get_user_identity(sender).await,
-            Ok(Some(identity)) if identity.is_verified() && !identity.has_verification_violation()
-        );
-        identity_ok
-            && matches!(
-                encryption.get_device(sender, device_id).await,
-                Ok(Some(device)) if device.is_verified_with_cross_signing()
-            )
+        let device = match encryption.get_device(sender, device_id).await {
+            Ok(Some(device)) => device,
+            _ => return false,
+        };
+        match self.inner.trust {
+            Trust::CrossSigned => device.is_cross_signed_by_owner(),
+            Trust::Verified => {
+                let identity_ok = matches!(
+                    encryption.get_user_identity(sender).await,
+                    Ok(Some(identity)) if identity.is_verified() && !identity.has_verification_violation()
+                );
+                identity_ok && device.is_verified_with_cross_signing()
+            }
+        }
     }
 
     /// Inspect a room message. Call this first in the bot's message handler
@@ -410,7 +424,8 @@ impl AdminConsole {
              ✍️ Cross-signing: {cross_signing}, this device {}\n\
              🔐 You: {}\n\
              👑 Admins: {}\n\
-             🔒 Admin chats: encryption {}, verified device {}",
+             🔒 Admin chats: encryption {}, trusted device {}\n\
+             🤝 Trust: {}",
             self.inner.bot_name,
             self.inner.version,
             client
@@ -433,6 +448,10 @@ impl AdminConsole {
             self.inner.admins.len(),
             required(self.inner.policy.require_encryption),
             required(self.inner.policy.require_verified_device),
+            match self.inner.trust {
+                Trust::Verified => "verified with me",
+                Trust::CrossSigned => "cross-signed by its owner",
+            },
         )
     }
 }
@@ -493,9 +512,17 @@ fn parse_reset_trust<'a>(mut parts: impl Iterator<Item = &'a str>) -> Command {
     }
 }
 
-/// Why a message doesn't count as coming from a verified device, and what
+/// Why a message doesn't count as coming from a trusted device, and what
 /// the admin can do about it.
-fn unverified_reason(level: Option<&VerificationLevel>) -> &'static str {
+fn unverified_reason(trust: Trust, level: Option<&VerificationLevel>) -> &'static str {
+    if trust == Trust::CrossSigned {
+        return match level {
+            Some(VerificationLevel::None(_)) => {
+                "I don't know the session this came from yet. Send it again in a minute. If that doesn't help, verify this session with your other sessions"
+            }
+            _ => "You haven't verified this session yet. Verify it with another session or your recovery key (Element: Settings → Sessions)",
+        };
+    }
     match level {
         Some(VerificationLevel::UnverifiedIdentity) => {
             "You and I aren't verified yet. Run !admin verify"
@@ -573,17 +600,31 @@ mod tests {
     #[test]
     fn an_unverified_device_is_told_what_to_do() {
         use matrix_sdk::deserialized_responses::DeviceLinkProblem;
+        assert!(unverified_reason(
+            Trust::Verified,
+            Some(&VerificationLevel::UnverifiedIdentity)
+        )
+        .contains("!admin verify"));
         assert!(
-            unverified_reason(Some(&VerificationLevel::UnverifiedIdentity))
-                .contains("!admin verify")
+            unverified_reason(Trust::Verified, Some(&VerificationLevel::UnsignedDevice))
+                .contains("you haven't verified this session")
         );
-        assert!(unverified_reason(Some(&VerificationLevel::UnsignedDevice))
-            .contains("you haven't verified this session"));
-        assert!(unverified_reason(Some(&VerificationLevel::None(
-            DeviceLinkProblem::MissingDevice
-        )))
+        assert!(unverified_reason(
+            Trust::Verified,
+            Some(&VerificationLevel::None(DeviceLinkProblem::MissingDevice))
+        )
         .contains("Send it again"));
-        assert!(unverified_reason(None).contains("!admin verify"));
+        assert!(unverified_reason(Trust::Verified, None).contains("!admin verify"));
+        // Cross-signed trust: only their own sessions matter, never `!admin verify`.
+        for level in [
+            VerificationLevel::UnverifiedIdentity,
+            VerificationLevel::VerificationViolation,
+            VerificationLevel::UnsignedDevice,
+        ] {
+            let reason = unverified_reason(Trust::CrossSigned, Some(&level));
+            assert!(reason.contains("another session"), "{level:?}");
+            assert!(!reason.contains("!admin verify") && !reason.contains("!reset-trust"));
+        }
     }
 
     #[test]

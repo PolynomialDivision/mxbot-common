@@ -68,6 +68,7 @@ Broadcasting bots post to `bot.broadcast_rooms()`: joined rooms allowed by
 | `security.dm_rooms` | Rooms whose current members may open a private chat with the bot (direct invite; the bot leaves unless it is just the two of them, encrypted). Bots check such chats with `bot.is_member_dm(&room, &user)`. |
 | `security.admin_users` | Admins. Invalid IDs are a startup error. |
 | `security.encryption_strategy` | `identity_based` (default), `only_trusted`, `all_devices`. |
+| `security.trust` | Whose devices count. `verified` (default): an identity verified with the bot (`!admin verify`); if that person resets their keys, nothing reaches them until another admin runs `!reset-trust` and they verify again. `cross_signed`: every device signed with the person's current identity; a new identity is accepted (logged), unsigned devices still get nothing. Goes with `identity_based`. Gives up protection against a full account takeover with a key reset. |
 | `security.verification.*` | Who may verify with the bot (admins always may), flow limits. |
 | `security.admin_dm.*` | Admin direct-chat policy, see below. |
 
@@ -97,9 +98,11 @@ of in shared rooms:
 A message is accepted only if the sender is an admin, the room is the bot's
 direct chat with exactly that admin (the bot's own `m.direct` data, no other
 members), the event was end-to-end encrypted (`require_encryption`, default
-on) and (with `require_verified_device = true`) it came from a device the
-bot has verified. Bot-specific commands (e.g. `!startquiz`) are passed back
-to the bot as `Dispatch::AdminDm` and answered in the direct chat.
+on) and (with `require_verified_device = true`) it came from a device that
+counts under `security.trust`: verified with the bot, or (`cross_signed`)
+signed by the admin's own current identity. Bot-specific commands (e.g.
+`!startquiz`) are passed back to the bot as `Dispatch::AdminDm` and
+answered in the direct chat.
 `!reset-trust` / `!verify-device` keep working silently in shared rooms.
 
 ## Runtime settings

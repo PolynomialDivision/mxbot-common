@@ -9,6 +9,7 @@
 //! * [`matrix_sdk`]: the fleet's (forked) Matrix SDK; bots use this
 //!   re-export instead of depending on the SDK themselves.
 //! * [`heartbeat`]: optional liveness file for container health checks.
+//! * [`trust`]: whose devices count (`[security] trust`).
 
 pub mod admin;
 mod bot;
@@ -24,6 +25,7 @@ pub mod send;
 pub mod session;
 pub mod settings;
 pub mod sync;
+pub mod trust;
 pub mod verify;
 
 pub use bot::{Bot, BotBuilder};

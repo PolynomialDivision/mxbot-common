@@ -82,6 +82,10 @@ impl BotBuilder {
         let (client, user_id) =
             session::build_and_restore(&matrix, &matrix_store, security.encryption_strategy.into())
                 .await?;
+        crate::trust::set(security.trust);
+        if crate::trust::follows_new_identities() {
+            crate::trust::watch(client.clone()).await;
+        }
 
         let admins = Arc::new(security.admins()?);
         if admins.is_empty() {
@@ -128,6 +132,7 @@ impl BotBuilder {
             self.version,
             Arc::clone(&admins),
             security.admin_dm.clone(),
+            security.trust,
             verification.clone(),
             self.settings,
             self.admin_help,
@@ -177,9 +182,14 @@ impl Bot {
         self.admin.admins()
     }
 
-    /// First sync (retried until it succeeds), then pending invites.
+    /// First sync (retried until it succeeds), then pending invites. With
+    /// `trust = "cross_signed"`, identities that changed meanwhile are
+    /// accepted before anything is sent.
     pub async fn initial_sync(&self) {
         sync::initial_sync(&self.client).await;
+        if crate::trust::follows_new_identities() {
+            crate::trust::accept_changed_in_rooms(&self.client).await;
+        }
         rooms::join_pending_invites(&self.client, &self.invites).await;
     }
 

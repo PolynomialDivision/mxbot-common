@@ -115,10 +115,22 @@ where
 {
     let mut backoff = Backoff::new(INITIAL_BACKOFF, MAX_BACKOFF);
     let mut attempt = 1;
+    let mut accepted = false;
     loop {
         match attempt_send().await {
             Ok(event_id) => return Ok(event_id),
             Err(error) => {
+                // `trust = "cross_signed"`: someone's identity changed and the
+                // watcher hasn't caught up yet. Accept it, then once more.
+                if let Some(users) = crate::trust::changed_identities(&error) {
+                    if !accepted
+                        && crate::trust::follows_new_identities()
+                        && crate::trust::accept_new_identities(&room.client(), users).await
+                    {
+                        accepted = true;
+                        continue;
+                    }
+                }
                 let (retryable, retry_after) = classify_send_error(&error);
                 if !retryable || attempt >= MAX_ATTEMPTS {
                     return Err(error);
