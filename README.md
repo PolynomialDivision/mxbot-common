@@ -39,7 +39,7 @@ let bot = Bot::builder("my-bot", env!("CARGO_PKG_VERSION"))
 
 bot.client.add_event_handler(/* bot handlers, see below */);
 bot.initial_sync().await;                  // retried; also joins pending invites
-bot.run().await                            // sync with backoff until SIGTERM/SIGINT
+bot.run().await                            // sync until SIGTERM/SIGINT (finishes the batch in hand)
 ```
 
 A message handler starts with the admin console:

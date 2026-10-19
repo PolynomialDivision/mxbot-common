@@ -70,6 +70,7 @@ impl BotBuilder {
     pub async fn start(self, matrix: &MatrixConfig, security: &SecurityConfig) -> Result<Bot> {
         // Fail closed: a forgotten allow-list must not open the bot up.
         security.validate()?;
+        sync::listen_for_stop();
         let mut matrix = matrix.clone();
         matrix.apply_env_overrides();
 
@@ -200,10 +201,26 @@ impl Bot {
     }
 
     /// [`Bot::run`], calling `on_reconnect` whenever the sync loop restarts.
+    ///
+    /// On SIGTERM the batch of events being handled is finished (up to
+    /// [`sync::STOP_GRACE`]), so no tap or message is half done and lost:
+    /// the SDK has already moved its sync position past that batch. Idle,
+    /// waiting for the server, there is nothing to finish and the wait
+    /// simply runs out.
     pub async fn run_with(&self, on_reconnect: impl FnMut()) -> anyhow::Result<()> {
+        let sync = sync::sync_until_stopped(&self.client, on_reconnect);
+        tokio::pin!(sync);
         tokio::select! {
-            _ = sync::sync_forever_with(&self.client, on_reconnect) => {}
-            () = sync::shutdown_signal() => {}
+            () = &mut sync => return Ok(()),
+            () = sync::stop_requested() => {}
+        }
+        if tokio::time::timeout(sync::STOP_GRACE, &mut sync)
+            .await
+            .is_ok()
+        {
+            info!("Stopped after the last sync batch");
+        } else {
+            info!("Stopped: no sync batch finished in time (idle, or a handler still busy)");
         }
         Ok(())
     }
