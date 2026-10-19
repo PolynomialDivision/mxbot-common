@@ -167,6 +167,18 @@ impl AdminConsole {
         admin_dm_partner(room, &self.inner.admins).is_some()
     }
 
+    /// Whether a message that isn't text (a file, say) passes what a console
+    /// command must: an admin, in their direct chat, encrypted, from a
+    /// trusted device. For bots that take more than commands there.
+    pub async fn is_console(
+        &self,
+        room: &Room,
+        sender: &UserId,
+        encryption: Option<&EncryptionInfo>,
+    ) -> bool {
+        self.access(room, sender, encryption).await == Access::Granted
+    }
+
     async fn access(
         &self,
         room: &Room,
