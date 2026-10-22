@@ -10,7 +10,9 @@
 //!   re-export instead of depending on the SDK themselves.
 //! * [`heartbeat`]: optional liveness file for container health checks.
 //! * [`trust`]: whose devices count (`[security] trust`).
-//! * `calendar` (feature `calendar`): iCalendar and CalDAV, for calendar-bot and plenum-bot.
+//! * `calendar` (feature `calendar`): iCalendar and CalDAV, for calendar-bot and plenum-bot;
+//!   a Nextcloud account's own calendars (make, share, write events), for plenum-bot and
+//!   cleaning-bot.
 //! * `directory` (feature `directory`): the house's directory (people, accounts, groups).
 
 pub mod admin;

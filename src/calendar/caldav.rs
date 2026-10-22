@@ -20,9 +20,34 @@ pub struct Source {
     pub username: Option<String>,
     /// HTTP Basic Auth password (optional).
     pub password: Option<String>,
+    /// The environment variable with the password, instead of `password` (an app password
+    /// the deployment writes next to the bot, never into its config). Read by
+    /// [`Source::resolve_password_env`].
+    #[serde(default)]
+    pub password_env: Option<String>,
     /// Calendar slugs to skip when using caldav_account_url (e.g. ["contacts", "birthdays"]).
     #[serde(default)]
     pub exclude: Vec<String>,
+}
+
+impl Source {
+    /// `password` from the variable `password_env` names, when there is no `password`. A
+    /// variable that is missing or empty is an error: the bot must not run without it.
+    pub fn resolve_password_env(&mut self) -> Result<()> {
+        if self.password.is_some() {
+            return Ok(());
+        }
+        let Some(var) = &self.password_env else {
+            return Ok(());
+        };
+        let value = std::env::var(var)
+            .ok()
+            .map(|v| v.trim().to_owned())
+            .filter(|v| !v.is_empty())
+            .with_context(|| format!("password_env: {var} is not set"))?;
+        self.password = Some(value);
+        Ok(())
+    }
 }
 
 /// The events of one CalDAV collection between `start` and `end`, their times in `zone`.
@@ -332,11 +357,9 @@ pub async fn fetch_source_ics_events(
         for url in &calendar_urls {
             let cal_src = Source {
                 caldav_url: Some(url.clone()),
-                caldav_account_url: None,
-                ics_url: None,
                 username: src.username.clone(),
                 password: src.password.clone(),
-                exclude: vec![],
+                ..Default::default()
             };
             match fetch_ics_caldav(http, &cal_src, start, end).await {
                 Ok(blocks) => blocks
@@ -381,6 +404,30 @@ mod tests {
         assert!(multistatus("q", ok, "<d:multistatus xmlns:d='DAV:'/>").is_ok());
         assert!(multistatus("q", fine, "<d:multistatus xmlns:d='DAV:'/>").is_err());
         assert!(multistatus("q", ok, "<html>login</html>").is_err());
+    }
+
+    #[test]
+    fn the_password_can_come_from_the_environment() {
+        let mut src: Source = toml::from_str(
+            "caldav_account_url = 'https://cloud.example.org/remote.php/dav/calendars/bot/'\n\
+             username = 'bot'\npassword_env = 'MXBOT_TEST_CALDAV_PASSWORD'",
+        )
+        .unwrap();
+        assert!(src.resolve_password_env().is_err(), "unset is an error");
+        std::env::set_var("MXBOT_TEST_CALDAV_PASSWORD", " app-password\n");
+        src.resolve_password_env().unwrap();
+        assert_eq!(src.password.as_deref(), Some("app-password"));
+        // a password in the config wins; no variable, nothing to do
+        let mut fixed = Source {
+            password: Some("fixed".into()),
+            password_env: Some("MXBOT_TEST_CALDAV_UNSET".into()),
+            ..Default::default()
+        };
+        fixed.resolve_password_env().unwrap();
+        assert_eq!(fixed.password.as_deref(), Some("fixed"));
+        let mut none = Source::default();
+        none.resolve_password_env().unwrap();
+        assert_eq!(none.password, None);
     }
 
     #[test]

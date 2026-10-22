@@ -125,6 +125,17 @@ and stored in `store/settings.json`. Secrets never belong in `T`.
 * `persist`: atomic JSON load/save for bot state files.
 * `retry`: `Backoff` with optional jitter.
 * `session`: build a client for secondary accounts.
+* `calendar` (feature `calendar`): `ics` (parsing, recurrence), `caldav`
+  (reading ICS URLs and CalDAV collections; a source's password may come from
+  the environment with `password_env` and `Source::resolve_password_env`) and
+  `nextcloud`: a Nextcloud account's own calendars, made with a display name
+  (`ensure_calendar`), listed and deleted, shared (`share`, `unshare`,
+  `shares`, `plan_shares`), and single events written by UID (`put_event`
+  with `Precondition::Create` / `Match(etag)` / `Overwrite`, `delete_event`,
+  where a missing event is no error) and listed with their ETags
+  (`list_events`, one PROPFIND without event data).
+* `directory` (feature `directory`): the house's directory (people, their
+  Matrix accounts and groups).
 
 ## Developing against a local checkout
 
