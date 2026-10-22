@@ -145,29 +145,36 @@ pub fn strip_reply_fallback(body: &str) -> &str {
 }
 
 /// A message from Markdown: the Markdown as the plain body, HTML for clients. Raw HTML in
-/// the Markdown (typed by people, or from a system's output) is shown as text.
+/// the Markdown (typed by people, or from a system's output) is shown as text; `~~struck~~`
+/// is struck through.
 #[cfg(feature = "markdown")]
 pub fn markdown(text: &str) -> RoomMessageEventContent {
-    render_markdown(text, text)
+    render_markdown(text, pulldown_cmark::Options::ENABLE_STRIKETHROUGH, false)
 }
 
-/// [`markdown`] where every single newline is a line break too (reports written line by
-/// line).
+/// [`markdown`] for reports written line by line: every single newline is a line break
+/// (also in a heading's or a list's neighbourhood, unlike a trailing backslash), and a `~`
+/// is a tilde ("~5 GB"), never strikethrough.
 #[cfg(feature = "markdown")]
 pub fn markdown_with_breaks(text: &str) -> RoomMessageEventContent {
-    render_markdown(text, &text.lines().collect::<Vec<_>>().join("\\\n"))
+    render_markdown(text, pulldown_cmark::Options::empty(), true)
 }
 
 #[cfg(feature = "markdown")]
-fn render_markdown(body: &str, source: &str) -> RoomMessageEventContent {
-    use pulldown_cmark::{Event, Options, Parser};
-    let events = Parser::new_ext(source, Options::ENABLE_STRIKETHROUGH).map(|e| match e {
+fn render_markdown(
+    text: &str,
+    options: pulldown_cmark::Options,
+    breaks: bool,
+) -> RoomMessageEventContent {
+    use pulldown_cmark::{Event, Parser};
+    let events = Parser::new_ext(text, options).map(|e| match e {
         Event::Html(t) | Event::InlineHtml(t) => Event::Text(t),
+        Event::SoftBreak if breaks => Event::HardBreak,
         other => other,
     });
     let mut html = String::new();
     pulldown_cmark::html::push_html(&mut html, events);
-    RoomMessageEventContent::text_html(body, html.trim_end())
+    RoomMessageEventContent::text_html(text, html.trim_end())
 }
 
 /// Escape `&`, `<`, `>`, `"` and `'` for HTML content and attributes.
@@ -436,8 +443,14 @@ mod tests {
                 && h.contains("<del>old</del>"),
             "{h}"
         );
-        let (body, h) = html(markdown_with_breaks("**Disk** ok\nsecond line"));
-        assert_eq!(body, "**Disk** ok\nsecond line");
-        assert!(h.contains("<br"), "{h}");
+        let (body, h) = html(markdown_with_breaks(
+            "**Disk** ok\nsecond line\n## Heading\n~5 GB of ~3 GB",
+        ));
+        assert_eq!(body, "**Disk** ok\nsecond line\n## Heading\n~5 GB of ~3 GB");
+        assert!(
+            h.contains("ok<br />") && h.contains("<h2>Heading</h2>"),
+            "{h}"
+        );
+        assert!(!h.contains("<del>") && h.contains("~5 GB of ~3 GB"), "{h}");
     }
 }
