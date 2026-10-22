@@ -5,7 +5,12 @@
 //! attribute) and the other accounts an admin entered for them (the `matrix_ids`
 //! attribute: a list of full Matrix IDs, or one string separated by commas or spaces).
 //! Only active people count, never service accounts. The API token comes from the
-//! environment (`token_env`, `DIRECTORY_TOKEN` by default), never from the config.
+//! environment (`token_env`, `DIRECTORY_TOKEN` by default), never from the config; it needs
+//! to view users and groups.
+//!
+//! A group nobody is in is missing from [`groups`]; a bot that must tell "exists, but has
+//! nobody" from "unknown" reads [`Directory::existing_groups`] too and builds the answer
+//! with [`groups_with_empty`].
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
@@ -76,7 +81,7 @@ pub struct Person {
 pub type Groups = BTreeMap<String, BTreeSet<OwnedUserId>>;
 
 /// The accounts of each of `wanted` that anyone is in; a group nobody is in (or that does
-/// not exist) is missing from the answer.
+/// not exist) is missing from the answer. [`groups_with_empty`] tells the two apart.
 pub fn groups(people: &[Person], wanted: &BTreeSet<String>) -> Groups {
     let mut out = Groups::new();
     for person in people {
@@ -85,6 +90,21 @@ pub fn groups(people: &[Person], wanted: &BTreeSet<String>) -> Groups {
                 .or_default()
                 .extend(person.accounts.iter().cloned());
         }
+    }
+    out
+}
+
+/// [`groups`], plus an empty entry for each of `wanted` that `existing` names (from
+/// [`Directory::existing_groups`]) and nobody is in: a group that exists but has nobody is
+/// in the answer with no accounts, only an unknown group is missing from it.
+pub fn groups_with_empty(
+    people: &[Person],
+    wanted: &BTreeSet<String>,
+    existing: &BTreeSet<String>,
+) -> Groups {
+    let mut out = groups(people, wanted);
+    for group in wanted.iter().filter(|g| existing.contains(*g)) {
+        out.entry(group.clone()).or_default();
     }
     out
 }
@@ -129,14 +149,50 @@ impl Directory {
     /// nobody is broken, and a bot acting on it would remove everyone.
     pub async fn people(&self) -> Result<Vec<Person>> {
         let DirectoryProvider::Authentik = self.cfg.provider;
+        let users: Vec<User> = self
+            .all_pages("core/users/?is_active=true&include_groups=true", "users")
+            .await?;
+        let people = people_of(&users, &self.cfg, &self.server_name);
+        if people.is_empty() {
+            bail!("the directory names nobody");
+        }
+        Ok(people)
+    }
+
+    /// Which of `wanted` exist in the directory, whether anyone is in them or not (a group
+    /// that is missing from [`groups`] exists with nobody in it when it is in this answer).
+    /// An answer without any group is an error: every house has groups, and a token that may
+    /// not see them gets an empty list from Authentik, not a refusal.
+    pub async fn existing_groups(&self, wanted: &BTreeSet<String>) -> Result<BTreeSet<String>> {
+        let DirectoryProvider::Authentik = self.cfg.provider;
+        if wanted.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+        let all: Vec<Group> = self
+            .all_pages("core/groups/?include_users=false", "groups")
+            .await?;
+        if all.is_empty() {
+            bail!("the directory names no group");
+        }
+        Ok(all
+            .into_iter()
+            .map(|g| g.name)
+            .filter(|g| wanted.contains(g))
+            .collect())
+    }
+
+    /// Every page of a list (`path` with its query, below the API base).
+    async fn all_pages<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        what: &str,
+    ) -> Result<Vec<T>> {
         let base = self.cfg.api_url.trim_end_matches('/');
-        let mut users: Vec<User> = Vec::new();
+        let mut out: Vec<T> = Vec::new();
         let mut page = 1u64;
         // At most 50 pages of 200: far more than a house.
         for _ in 0..50 {
-            let url = format!(
-                "{base}/core/users/?is_active=true&include_groups=true&page_size=200&page={page}"
-            );
+            let url = format!("{base}/{path}&page_size=200&page={page}");
             let body = self
                 .http
                 .get(&url)
@@ -149,20 +205,15 @@ impl Directory {
                 .bytes()
                 .await
                 .context("reading the directory")?;
-            let answer: Page = serde_json::from_slice(&body).context("the directory's answer")?;
-            users.extend(answer.results);
+            let answer: Page<T> =
+                serde_json::from_slice(&body).context("the directory's answer")?;
+            out.extend(answer.results);
             match answer.pagination.and_then(|p| p.next.as_u64()) {
                 Some(next) if next > page => page = next,
-                _ => {
-                    let people = people_of(&users, &self.cfg, &self.server_name);
-                    if people.is_empty() {
-                        bail!("the directory names nobody");
-                    }
-                    return Ok(people);
-                }
+                _ => return Ok(out),
             }
         }
-        bail!("the directory has more than 50 pages of users")
+        bail!("the directory has more than 50 pages of {what}")
     }
 }
 
@@ -189,8 +240,8 @@ fn yes() -> bool {
 }
 
 #[derive(Deserialize)]
-struct Page {
-    results: Vec<User>,
+struct Page<T> {
+    results: Vec<T>,
     #[serde(default)]
     pagination: Option<Pagination>,
 }
@@ -319,6 +370,102 @@ mod tests {
         assert_eq!(g["finance"].len(), 3);
         assert!(!g.contains_key("kitchen-floor-4"));
         assert!(!g.contains_key("kitchen-floor-3"));
+    }
+
+    #[test]
+    fn an_existing_group_without_anyone_is_empty_an_unknown_one_missing() {
+        let wanted: BTreeSet<String> = ["kitchen-floor-1", "finance", "kitchen-floor-4", "gone"]
+            .map(String::from)
+            .into();
+        let existing: BTreeSet<String> = ["kitchen-floor-1", "finance", "kitchen-floor-4"]
+            .map(String::from)
+            .into();
+        let g = groups_with_empty(&people(), &wanted, &existing);
+        assert_eq!(g["kitchen-floor-1"].len(), 5);
+        assert_eq!(g["finance"].len(), 3);
+        assert!(g["kitchen-floor-4"].is_empty());
+        assert!(!g.contains_key("gone"));
+        // a group not wanted stays out, even if it exists
+        assert!(!g.contains_key("kitchen-floor-3"));
+        // a group someone is in counts even when the group list missed it (read in between)
+        let g = groups_with_empty(&people(), &wanted, &BTreeSet::new());
+        assert_eq!(g, groups(&people(), &wanted));
+    }
+
+    fn reader(url: String, token_env: &str) -> Directory {
+        let mut c = cfg();
+        c.api_url = url;
+        c.token_env = token_env.into();
+        Directory::new(&c, &UserId::parse("@bot:house.org").unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn existing_groups_reads_every_page_and_no_group_at_all_is_an_error() {
+        use wiremock::matchers::{header, method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        std::env::set_var("MXBOT_TEST_GROUPS_TOKEN", "secret");
+        let wanted: BTreeSet<String> = ["finance", "kitchen-floor-4", "gone"]
+            .map(String::from)
+            .into();
+        let server = MockServer::start().await;
+        for (page, next, names) in [
+            ("1", 2, ["residents", "finance"]),
+            ("2", 0, ["kitchen-floor-4", "it-admins"]),
+        ] {
+            Mock::given(method("GET"))
+                .and(path("/api/v3/core/groups/"))
+                .and(query_param("page", page))
+                .and(query_param("page_size", "200"))
+                .and(query_param("include_users", "false"))
+                .and(header("authorization", "Bearer secret"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "pagination": {"next": next},
+                    "results": names.map(|n| serde_json::json!({"pk": n, "name": n, "users": []})),
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        let dir = reader(
+            format!("{}/api/v3", server.uri()),
+            "MXBOT_TEST_GROUPS_TOKEN",
+        );
+        let found = dir.existing_groups(&wanted).await.unwrap();
+        assert_eq!(
+            found,
+            ["finance", "kitchen-floor-4"].map(String::from).into()
+        );
+        // nothing wanted: nothing asked
+        assert!(dir
+            .existing_groups(&BTreeSet::new())
+            .await
+            .unwrap()
+            .is_empty());
+
+        // a token that may not see groups gets an empty list: an error, not "none exist"
+        let empty = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"results": []})),
+            )
+            .mount(&empty)
+            .await;
+        let dir = reader(empty.uri(), "MXBOT_TEST_GROUPS_TOKEN");
+        assert!(dir.existing_groups(&wanted).await.is_err());
+        let refused = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&refused)
+            .await;
+        let dir = reader(refused.uri(), "MXBOT_TEST_GROUPS_TOKEN");
+        assert!(dir.existing_groups(&wanted).await.is_err());
+        let garbled = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("<html>"))
+            .mount(&garbled)
+            .await;
+        let dir = reader(garbled.uri(), "MXBOT_TEST_GROUPS_TOKEN");
+        assert!(dir.existing_groups(&wanted).await.is_err());
     }
 
     #[tokio::test]
