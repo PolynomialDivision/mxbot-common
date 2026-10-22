@@ -8,9 +8,14 @@ description = "Shared Matrix infrastructure for the mxbot fleet"
 default = []
 # Forwards matrix-sdk's test helpers for bots whose tests mock a homeserver.
 testing = ["matrix-sdk/testing"]
+# iCalendar and CalDAV (src/calendar): calendar-bot, plenum-bot.
+calendar = ["dep:chrono", "dep:chrono-tz", "dep:reqwest"]
 
 [dependencies]
 anyhow             = "1"
+chrono             = { version = "0.4", optional = true }
+chrono-tz          = { version = "0.10", optional = true }
+reqwest            = { version = "0.13", default-features = false, features = ["rustls"], optional = true }
 futures-util       = "0.3"
 # The one place the fleet's Matrix SDK is defined. The fork copies `m.mentions`
 # into the cleartext wrapper of encrypted events (MSC3952) so that mention

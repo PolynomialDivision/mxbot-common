@@ -10,9 +10,12 @@
 //!   re-export instead of depending on the SDK themselves.
 //! * [`heartbeat`]: optional liveness file for container health checks.
 //! * [`trust`]: whose devices count (`[security] trust`).
+//! * `calendar` (feature `calendar`): iCalendar and CalDAV, for calendar-bot and plenum-bot.
 
 pub mod admin;
 mod bot;
+#[cfg(feature = "calendar")]
+pub mod calendar;
 pub mod config;
 pub mod format;
 pub mod heartbeat;
