@@ -15,7 +15,7 @@ use chrono::{
 
 // ── Parsed events ─────────────────────────────────────────────────────────────
 
-/// A start or end, converted to the bot's local time.
+/// A start or end, converted to the zone the calendar was read in (`parse_ics_in`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IcsTime {
     Date(NaiveDate),
@@ -40,6 +40,8 @@ pub struct IcsEvent {
     pub end: Option<IcsTime>,
     pub duration: Option<Duration>,
     pub rrule: Option<String>,
+    /// The series' end (the RRULE's UNTIL), converted like `start`.
+    pub until: Option<IcsTime>,
     /// Local dates of excluded occurrences.
     pub exdates: Vec<NaiveDate>,
     /// Set on a single occurrence that replaces (moves or cancels) the
@@ -73,9 +75,9 @@ fn param<'a>(params: &'a str, name: &str) -> Option<&'a str> {
     })
 }
 
-/// A DATE / DATE-TIME value in local time: UTC (`…Z`) and `TZID` values are
-/// converted, floating times are taken as local.
-fn parse_time(value: &str, params: &str) -> Option<IcsTime> {
+/// A DATE / DATE-TIME value in `zone`: UTC (`…Z`) and `TZID` values are converted,
+/// floating times are taken as they are.
+fn parse_time<Z: TimeZone>(value: &str, params: &str, zone: &Z) -> Option<IcsTime> {
     let value = value.trim();
     let is_date = param(params, "VALUE").is_some_and(|v| v.eq_ignore_ascii_case("DATE"))
         || (value.len() == 8 && value.bytes().all(|b| b.is_ascii_digit()));
@@ -87,12 +89,12 @@ fn parse_time(value: &str, params: &str) -> Option<IcsTime> {
     let naive = NaiveDateTime::parse_from_str(value.get(..15)?, "%Y%m%dT%H%M%S").ok()?;
     let local = if value.ends_with('Z') {
         Utc.from_utc_datetime(&naive)
-            .with_timezone(&Local)
+            .with_timezone(zone)
             .naive_local()
     } else if let Some(tz) = param(params, "TZID").and_then(|t| t.parse::<chrono_tz::Tz>().ok()) {
         tz.from_local_datetime(&naive)
             .earliest()
-            .map(|dt| dt.with_timezone(&Local).naive_local())
+            .map(|dt| dt.with_timezone(zone).naive_local())
             .unwrap_or(naive)
     } else {
         // Floating time, or a TZID we don't know (e.g. Windows zone names).
@@ -132,7 +134,14 @@ fn parse_duration(s: &str) -> Option<Duration> {
     Some(total * sign)
 }
 
+/// The events of `ics`, their times in the machine's local zone (`TZ`).
 pub fn parse_ics(ics: &str) -> Vec<IcsEvent> {
+    parse_ics_in(ics, &Local)
+}
+
+/// The events of `ics`, their times in `zone`: a bot whose config names its zone reads
+/// calendars in it, whatever the machine's zone is.
+pub fn parse_ics_in<Z: TimeZone>(ics: &str, zone: &Z) -> Vec<IcsEvent> {
     let unfolded = unfold(ics);
     let mut events = Vec::new();
     // Properties of the VEVENT being read; nested components (VALARM) are
@@ -149,7 +158,7 @@ pub fn parse_ics(ics: &str) -> Vec<IcsEvent> {
         }
         if line == "END:VEVENT" {
             if let Some(props) = current.take() {
-                events.extend(build_event(&props));
+                events.extend(build_event(&props, zone));
             }
             continue;
         }
@@ -180,16 +189,25 @@ pub fn parse_ics(ics: &str) -> Vec<IcsEvent> {
     events
 }
 
-fn build_event(props: &[(String, String, String)]) -> Option<IcsEvent> {
+fn build_event<Z: TimeZone>(props: &[(String, String, String)], zone: &Z) -> Option<IcsEvent> {
     let get = |name: &str| props.iter().find(|(n, _, _)| n == name);
     let (_, start_params, start_value) = get("DTSTART")?;
-    let start = parse_time(start_value, start_params)?;
+    let start = parse_time(start_value, start_params, zone)?;
+    let rrule = get("RRULE").map(|(_, _, v)| v.trim().to_owned());
+    let until = rrule.as_deref().and_then(|rule| {
+        rule.split(';').find_map(|part| {
+            let (key, value) = part.split_once('=')?;
+            key.trim()
+                .eq_ignore_ascii_case("UNTIL")
+                .then(|| parse_time(value, "", zone))?
+        })
+    });
     let mut exdates = Vec::new();
     for (_, params, value) in props.iter().filter(|(n, _, _)| n == "EXDATE") {
         exdates.extend(
             value
                 .split(',')
-                .filter_map(|v| parse_time(v, params))
+                .filter_map(|v| parse_time(v, params, zone))
                 .map(IcsTime::date),
         );
     }
@@ -202,12 +220,13 @@ fn build_event(props: &[(String, String, String)]) -> Option<IcsEvent> {
             .map(|(_, _, v)| unescape(v).trim().to_owned())
             .filter(|l| !l.is_empty()),
         start,
-        end: get("DTEND").and_then(|(_, p, v)| parse_time(v, p)),
+        end: get("DTEND").and_then(|(_, p, v)| parse_time(v, p, zone)),
         duration: get("DURATION").and_then(|(_, _, v)| parse_duration(v.trim())),
-        rrule: get("RRULE").map(|(_, _, v)| v.trim().to_owned()),
+        rrule,
+        until,
         exdates,
         recurrence_id: get("RECURRENCE-ID")
-            .and_then(|(_, p, v)| parse_time(v, p))
+            .and_then(|(_, p, v)| parse_time(v, p, zone))
             .map(IcsTime::date),
         cancelled: get("STATUS")
             .is_some_and(|(_, _, v)| v.trim().eq_ignore_ascii_case("CANCELLED")),
@@ -229,6 +248,7 @@ struct Rule {
     freq: Freq,
     interval: i64,
     count: Option<usize>,
+    /// From the event (`IcsEvent::until`, converted when it was read).
     until: Option<IcsTime>,
     /// (ordinal, weekday): `3TH` → (Some(3), Thu), `-1FR` → (Some(-1), Fri).
     by_day: Vec<(Option<i32>, Weekday)>,
@@ -281,7 +301,7 @@ fn parse_rule(rule: &str) -> Option<Rule> {
             }
             "INTERVAL" => parsed.interval = value.parse().ok().filter(|&n| n > 0)?,
             "COUNT" => parsed.count = value.parse().ok(),
-            "UNTIL" => parsed.until = parse_time(value, ""),
+            // UNTIL: taken from the event (`IcsEvent::until`), already in its zone.
             "BYDAY" => {
                 parsed.by_day = value
                     .split(',')
@@ -530,9 +550,10 @@ pub fn expand(events: &[IcsEvent], from: NaiveDate, days: i64) -> Vec<(NaiveDate
         // before the window and are still running.
         let starts: Vec<NaiveDate> = match (&ev.rrule, ev.recurrence_id) {
             (Some(rule), None) => {
-                let Some(rule) = parse_rule(rule) else {
+                let Some(mut rule) = parse_rule(rule) else {
                     continue;
                 };
+                rule.until = ev.until;
                 let skip = ev.uid.as_deref().and_then(|uid| overridden.get(uid));
                 occurrence_dates(ev.start, &rule, to)
                     .into_iter()
@@ -794,13 +815,16 @@ mod tests {
             BEGIN:VEVENT\r\nUID:s\r\nSUMMARY:Plenum\r\nRECURRENCE-ID;TZID=Europe/Berlin:20261018T190000\r\nDTSTART;TZID=Europe/Berlin:20261018T190000\r\nSTATUS:CANCELLED\r\nEND:VEVENT\r\n\
             END:VCALENDAR\r\n";
 
-        let days = days_with(&parse_ics(ics), date(2026, 10, 4), 21);
+        // read in the series' own zone: in a zone far east, 19:00 Berlin is the next day
+        let berlin: chrono_tz::Tz = "Europe/Berlin".parse().unwrap();
+        let events = parse_ics_in(ics, &berlin);
+        let days = days_with(&events, date(2026, 10, 4), 21);
 
         assert_eq!(days, vec![date(2026, 10, 4), date(2026, 10, 12)]);
 
         // The moved occurrence keeps its key (the series date it replaces),
         // so the week update reports it as moved, not as new and cancelled.
-        let keys: Vec<String> = expand(&parse_ics(ics), date(2026, 10, 4), 21)
+        let keys: Vec<String> = expand(&events, date(2026, 10, 4), 21)
             .into_iter()
             .flat_map(|(_, entries)| entries)
             .map(|e| e.key)
@@ -850,6 +874,35 @@ mod tests {
             days_with(&parse_ics(&midnight), date(2026, 9, 25), 3),
             vec![date(2026, 9, 25)]
         );
+    }
+
+    #[test]
+    fn times_are_read_in_the_given_zone_whatever_the_machine_is_in() {
+        let berlin: chrono_tz::Tz = "Europe/Berlin".parse().unwrap();
+        let ics = vevent(
+            "UID:s\r\nSUMMARY:Plenum\r\nDTSTART;TZID=Europe/Berlin:20261101T190000\r\n\
+             RRULE:FREQ=WEEKLY;UNTIL=20261115T180000Z",
+        );
+        let events = parse_ics_in(&ics, &berlin);
+        let start = NaiveDate::from_ymd_opt(2026, 11, 1)
+            .unwrap()
+            .and_hms_opt(19, 0, 0)
+            .unwrap();
+        assert_eq!(events[0].start, IcsTime::DateTime(start));
+        // UNTIL 18:00Z is 19:00 in Berlin (winter): the 15th is the last one
+        assert_eq!(
+            events[0].until,
+            Some(IcsTime::DateTime(start + Duration::days(14)))
+        );
+        let days: Vec<NaiveDate> = expand(&events, start.date(), 30)
+            .into_iter()
+            .filter(|(_, e)| !e.is_empty())
+            .map(|(d, _)| d)
+            .collect();
+        assert_eq!(days, [1, 8, 15].map(|d| date(2026, 11, d)));
+        // the same in UTC: 18:00
+        let utc = parse_ics_in(&ics, &Utc);
+        assert_eq!(utc[0].start, IcsTime::DateTime(start - Duration::hours(1)));
     }
 
     #[test]

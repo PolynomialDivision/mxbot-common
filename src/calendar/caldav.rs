@@ -25,8 +25,9 @@ pub struct Source {
     pub exclude: Vec<String>,
 }
 
-/// The events of one CalDAV collection between `start` and `end`. Unlike an account's
-/// calendars, a failure is an error: the caller must not take "nothing" for "no events".
+/// The events of one CalDAV collection between `start` and `end`, their times in `zone`.
+/// Unlike an account's calendars, a failure is an error: the caller must not take "nothing"
+/// for "no events".
 pub async fn fetch_calendar(
     http: &reqwest::Client,
     url: &str,
@@ -34,6 +35,7 @@ pub async fn fetch_calendar(
     password: &str,
     start: NaiveDate,
     end: NaiveDate,
+    zone: &chrono_tz::Tz,
 ) -> Result<Vec<super::ics::IcsEvent>> {
     let src = Source {
         caldav_url: Some(url.to_owned()),
@@ -44,8 +46,85 @@ pub async fn fetch_calendar(
     let blocks = fetch_ics_caldav(http, &src, start, end).await?;
     Ok(blocks
         .iter()
-        .flat_map(|b| super::ics::parse_ics(b))
+        .flat_map(|b| super::ics::parse_ics_in(b, zone))
         .collect())
+}
+
+/// The text inside every element with the local name `name`, whatever namespace prefix the
+/// server chose (`<d:href>`, `<D:href>`, `<href xmlns="DAV:">`); an empty element is "".
+pub fn xml_elements<'a>(xml: &'a str, name: &str) -> Vec<&'a str> {
+    let mut out = Vec::new();
+    let mut rest = xml;
+    while let Some(open) = find_tag(rest, name) {
+        let after = &rest[open..];
+        let Some(gt) = after.find('>') else {
+            break;
+        };
+        if after[..gt].ends_with('/') {
+            out.push("");
+            rest = &after[gt + 1..];
+            continue;
+        }
+        let body = &after[gt + 1..];
+        let Some(close) = find_close(body, name) else {
+            break;
+        };
+        out.push(&body[..close]);
+        rest = &body[close..];
+    }
+    out
+}
+
+/// The position of the next `<name` or `<prefix:name` start tag.
+fn find_tag(xml: &str, name: &str) -> Option<usize> {
+    let mut from = 0;
+    while let Some(i) = xml[from..].find('<') {
+        let at = from + i;
+        let tag = &xml[at + 1..];
+        let local = tag
+            .split(|c: char| c.is_whitespace() || c == '>' || c == '/')
+            .next()
+            .unwrap_or("");
+        let local = local.rsplit(':').next().unwrap_or(local);
+        if !tag.starts_with('/') && local == name {
+            return Some(at);
+        }
+        from = at + 1;
+    }
+    None
+}
+
+fn find_close(xml: &str, name: &str) -> Option<usize> {
+    let mut from = 0;
+    while let Some(i) = xml[from..].find("</") {
+        let at = from + i;
+        let tag = &xml[at + 2..];
+        let local = tag.split('>').next().unwrap_or("").trim();
+        if local.rsplit(':').next() == Some(name) {
+            return Some(at);
+        }
+        from = at + 2;
+    }
+    None
+}
+
+/// Escape text for an XML element.
+pub fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// A WebDAV multistatus body, or an error: a login page or a proxy's answer with status 200
+/// must never read as "no events".
+fn multistatus(what: &str, status: reqwest::StatusCode, body: &str) -> Result<()> {
+    if status.as_u16() != 207 || find_tag(body, "multistatus").is_none() {
+        anyhow::bail!(
+            "{what}: no WebDAV multistatus (HTTP {status}): {}",
+            body.chars().take(200).collect::<String>()
+        );
+    }
+    Ok(())
 }
 
 fn add_auth(req: reqwest::RequestBuilder, src: &Source) -> reqwest::RequestBuilder {
@@ -138,7 +217,11 @@ pub async fn fetch_ics_caldav(
         src,
     );
 
-    let xml = xml_unescape(&req.send().await?.error_for_status()?.text().await?);
+    let resp = req.send().await?.error_for_status()?;
+    let status = resp.status();
+    let body = resp.text().await?;
+    multistatus("the calendar query", status, &body)?;
+    let xml = xml_unescape(&body);
 
     let mut blocks = Vec::new();
     let mut pos = 0;
@@ -180,48 +263,26 @@ pub async fn discover_calendars(http: &reqwest::Client, src: &Source) -> Result<
         src,
     );
 
-    let xml = req.send().await?.error_for_status()?.text().await?;
+    let resp = req.send().await?.error_for_status()?;
+    let status = resp.status();
+    let xml = resp.text().await?;
+    multistatus("the calendar list", status, &xml)?;
 
-    // Extract href values from responses that contain <C:calendar/> resourcetype.
-    // We split by <D:response> blocks and keep those that declare a calendar collection.
+    // The responses whose resource type is a calendar collection.
     let mut urls = Vec::new();
-    let mut pos = 0;
-    while let Some(rel) = xml[pos..]
-        .find("<D:response>")
-        .or_else(|| xml[pos..].find("<d:response>"))
-    {
-        let block_start = pos + rel;
-        let close_tag = if xml[block_start..].starts_with("<D:") {
-            "</D:response>"
-        } else {
-            "</d:response>"
-        };
-        let block_end = xml[block_start..]
-            .find(close_tag)
-            .map(|i| block_start + i + close_tag.len())
-            .unwrap_or(xml.len());
-        let block = &xml[block_start..block_end];
-        pos = block_end;
-
-        let is_calendar = block.contains(":calendar/>")
-            || block.contains(":calendar />")
-            || block.contains(":calendar>");
+    for block in xml_elements(&xml, "response") {
+        let is_calendar = xml_elements(block, "resourcetype")
+            .first()
+            .is_some_and(|t| !xml_elements(t, "calendar").is_empty());
         if !is_calendar {
             continue;
         }
-
-        // Extract the href from this response block.
-        let href = block
-            .find("<D:href>")
-            .or_else(|| block.find("<d:href>"))
-            .and_then(|s| {
-                let after = &block[s..];
-                let val_start = after.find('>').map(|i| i + 1)?;
-                let val_end = after[val_start..].find('<').map(|i| val_start + i)?;
-                Some(after[val_start..val_end].trim().to_owned())
-            });
-
-        let Some(href) = href else { continue };
+        let Some(href) = xml_elements(block, "href")
+            .first()
+            .map(|h| xml_unescape(h.trim()))
+        else {
+            continue;
+        };
 
         // Skip the account root itself (returned as first entry).
         let account_path = reqwest::Url::parse(account_url)
@@ -300,6 +361,27 @@ pub async fn fetch_source_ics_events(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn elements_by_local_name_whatever_the_prefix() {
+        let xml = r#"<d:multistatus xmlns:d="DAV:"><d:response><d:href>/a/</d:href><d:propstat><d:prop><d:resourcetype><d:collection/><cal:calendar xmlns:cal="urn:ietf:params:xml:ns:caldav"/></d:resourcetype></d:prop></d:propstat></d:response><D:response><D:href>/b/</D:href><D:resourcetype/></D:response><response><href>/c/</href></response></d:multistatus>"#;
+        let responses = xml_elements(xml, "response");
+        assert_eq!(responses.len(), 3);
+        assert_eq!(xml_elements(responses[0], "href"), ["/a/"]);
+        assert_eq!(xml_elements(responses[0], "calendar"), [""]);
+        assert!(xml_elements(responses[0], "calendar-data").is_empty());
+        assert_eq!(xml_elements(responses[1], "resourcetype"), [""]);
+        assert_eq!(xml_elements(responses[2], "href"), ["/c/"]);
+    }
+
+    #[test]
+    fn only_a_multistatus_is_an_answer() {
+        let ok = reqwest::StatusCode::from_u16(207).unwrap();
+        let fine = reqwest::StatusCode::OK;
+        assert!(multistatus("q", ok, "<d:multistatus xmlns:d='DAV:'/>").is_ok());
+        assert!(multistatus("q", fine, "<d:multistatus xmlns:d='DAV:'/>").is_err());
+        assert!(multistatus("q", ok, "<html>login</html>").is_err());
+    }
 
     #[test]
     fn caldav_xml_is_unescaped() {
