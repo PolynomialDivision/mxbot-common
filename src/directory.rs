@@ -320,4 +320,61 @@ mod tests {
         assert!(!g.contains_key("kitchen-floor-4"));
         assert!(!g.contains_key("kitchen-floor-3"));
     }
+
+    #[tokio::test]
+    async fn reads_every_page_with_the_token_and_an_empty_answer_is_an_error() {
+        use wiremock::matchers::{header, method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        for (page, next, name) in [("1", 2, "one"), ("2", 0, "two")] {
+            Mock::given(method("GET"))
+                .and(path("/api/v3/core/users/"))
+                .and(query_param("page", page))
+                .and(query_param("is_active", "true"))
+                .and(query_param("include_groups", "true"))
+                .and(header("authorization", "Bearer secret"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "pagination": {"next": next},
+                    "results": [{"username": name, "type": "internal", "attributes": {},
+                                 "groups_obj": [{"name": "residents"}]}],
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        std::env::set_var("MXBOT_TEST_DIRECTORY_TOKEN", " secret\n");
+        let reader = |url: String| {
+            let mut c = cfg();
+            c.api_url = url;
+            c.token_env = "MXBOT_TEST_DIRECTORY_TOKEN".into();
+            Directory::new(&c, &UserId::parse("@bot:house.org").unwrap()).unwrap()
+        };
+        let people = reader(format!("{}/api/v3/", server.uri()))
+            .people()
+            .await
+            .unwrap();
+        let names: Vec<&str> = people.iter().map(|p| p.username.as_str()).collect();
+        assert_eq!(names, ["one", "two"]);
+        // the bot's own server for the house accounts
+        assert_eq!(people[0].accounts, ids(&["@one:house.org"]));
+
+        let empty = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"results": []})),
+            )
+            .mount(&empty)
+            .await;
+        assert!(reader(empty.uri()).people().await.is_err());
+        let refused = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&refused)
+            .await;
+        assert!(reader(refused.uri()).people().await.is_err());
+
+        let mut c = cfg();
+        c.token_env = "MXBOT_TEST_NO_SUCH_TOKEN".into();
+        assert!(Directory::new(&c, &UserId::parse("@bot:house.org").unwrap()).is_err());
+    }
 }
