@@ -4,7 +4,7 @@ use std::{collections::HashSet, path::PathBuf, sync::Arc};
 
 use anyhow::{Context, Result};
 use matrix_sdk::{
-    ruma::{OwnedUserId, UserId},
+    ruma::{events::MessageLikeEventContent, OwnedRoomId, OwnedUserId, UserId},
     Client, Room,
 };
 use tracing::{info, warn};
@@ -242,6 +242,23 @@ impl Bot {
             }
         }
         false
+    }
+
+    /// `content` into every room of [`Bot::broadcast_rooms`], each with retries of transient
+    /// failures (429, 5xx, network: [`crate::send::send_with_retry`]), so a busy homeserver
+    /// loses no post. Returns the rooms it still failed in; each is logged as a warning.
+    pub async fn broadcast<C>(&self, content: C) -> Vec<(OwnedRoomId, matrix_sdk::Error)>
+    where
+        C: MessageLikeEventContent + Clone,
+    {
+        let mut failed = Vec::new();
+        for room in self.broadcast_rooms() {
+            if let Err(e) = crate::send::send_with_retry(&room, content.clone()).await {
+                warn!(room = %room.room_id(), "Broadcast failed: {e}");
+                failed.push((room.room_id().to_owned(), e));
+            }
+        }
+        failed
     }
 
     /// Joined rooms for broadcast posts: allowed rooms, without admin
