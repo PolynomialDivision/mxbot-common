@@ -11,12 +11,15 @@
 //! * [`heartbeat`]: optional liveness file for container health checks.
 //! * [`trust`]: whose devices count (`[security] trust`).
 //! * `calendar` (feature `calendar`): iCalendar and CalDAV, for calendar-bot and plenum-bot.
+//! * `directory` (feature `directory`): the house's directory (people, accounts, groups).
 
 pub mod admin;
 mod bot;
 #[cfg(feature = "calendar")]
 pub mod calendar;
 pub mod config;
+#[cfg(feature = "directory")]
+pub mod directory;
 pub mod format;
 pub mod heartbeat;
 pub mod logging;

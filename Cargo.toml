@@ -10,6 +10,8 @@ default = []
 testing = ["matrix-sdk/testing"]
 # iCalendar and CalDAV (src/calendar): calendar-bot, plenum-bot.
 calendar = ["dep:chrono", "dep:chrono-tz", "dep:reqwest"]
+# The house's directory (src/directory.rs): plenum-bot, cleaning-bot.
+directory = ["dep:reqwest"]
 
 [dependencies]
 anyhow             = "1"
