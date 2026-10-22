@@ -130,6 +130,46 @@ pub fn sanitize_display_name(name: &str) -> Option<String> {
     (!cleaned.is_empty()).then_some(cleaned)
 }
 
+/// The body without a reply's quoted fallback: the `>` lines at its top and the blank
+/// lines after them. A quote further down is the message's own and stays.
+pub fn strip_reply_fallback(body: &str) -> &str {
+    let mut rest = body;
+    while rest.starts_with('>') {
+        rest = rest.split_once('\n').map_or("", |(_, r)| r);
+    }
+    if rest.len() == body.len() {
+        body
+    } else {
+        rest.trim_start()
+    }
+}
+
+/// A message from Markdown: the Markdown as the plain body, HTML for clients. Raw HTML in
+/// the Markdown (typed by people, or from a system's output) is shown as text.
+#[cfg(feature = "markdown")]
+pub fn markdown(text: &str) -> RoomMessageEventContent {
+    render_markdown(text, text)
+}
+
+/// [`markdown`] where every single newline is a line break too (reports written line by
+/// line).
+#[cfg(feature = "markdown")]
+pub fn markdown_with_breaks(text: &str) -> RoomMessageEventContent {
+    render_markdown(text, &text.lines().collect::<Vec<_>>().join("\\\n"))
+}
+
+#[cfg(feature = "markdown")]
+fn render_markdown(body: &str, source: &str) -> RoomMessageEventContent {
+    use pulldown_cmark::{Event, Options, Parser};
+    let events = Parser::new_ext(source, Options::ENABLE_STRIKETHROUGH).map(|e| match e {
+        Event::Html(t) | Event::InlineHtml(t) => Event::Text(t),
+        other => other,
+    });
+    let mut html = String::new();
+    pulldown_cmark::html::push_html(&mut html, events);
+    RoomMessageEventContent::text_html(body, html.trim_end())
+}
+
 /// Escape `&`, `<`, `>`, `"` and `'` for HTML content and attributes.
 pub fn html_escape(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
@@ -365,5 +405,39 @@ mod tests {
     fn sanitize_display_name_cleans_control_chars() {
         assert_eq!(sanitize_display_name(" A\nB ").as_deref(), Some("A B"));
         assert_eq!(sanitize_display_name(" \n "), None);
+    }
+
+    #[test]
+    fn a_replys_quote_is_not_the_message() {
+        assert_eq!(strip_reply_fallback("> <@anna:x> broken\n\n!top"), "!top");
+        assert_eq!(
+            strip_reply_fallback(">\n> two\n!top kitchen"),
+            "!top kitchen"
+        );
+        assert_eq!(strip_reply_fallback("> only a quote"), "");
+        let own = "My point:\n> a quote\nthe end";
+        assert_eq!(strip_reply_fallback(own), own);
+        assert_eq!(strip_reply_fallback("  plain  "), "  plain  ");
+    }
+
+    #[cfg(feature = "markdown")]
+    #[test]
+    fn markdown_shows_raw_html_as_text() {
+        use matrix_sdk::ruma::events::room::message::MessageType;
+        let html = |c: RoomMessageEventContent| match c.msgtype {
+            MessageType::Text(t) => (t.body, t.formatted.unwrap().body),
+            _ => panic!("text"),
+        };
+        let (body, h) = html(markdown("**bold** <img src=x onerror=alert(1)> ~~old~~"));
+        assert_eq!(body, "**bold** <img src=x onerror=alert(1)> ~~old~~");
+        assert!(
+            h.contains("<strong>bold</strong>")
+                && h.contains("&lt;img")
+                && h.contains("<del>old</del>"),
+            "{h}"
+        );
+        let (body, h) = html(markdown_with_breaks("**Disk** ok\nsecond line"));
+        assert_eq!(body, "**Disk** ok\nsecond line");
+        assert!(h.contains("<br"), "{h}");
     }
 }

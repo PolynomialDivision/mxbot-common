@@ -12,6 +12,8 @@ testing = ["matrix-sdk/testing"]
 calendar = ["dep:chrono", "dep:chrono-tz", "dep:reqwest"]
 # The house's directory (src/directory.rs): plenum-bot, cleaning-bot.
 directory = ["dep:reqwest"]
+# Markdown messages (format::markdown): plenum-bot, health-bot.
+markdown = ["dep:pulldown-cmark"]
 
 [dependencies]
 anyhow             = "1"
@@ -19,6 +21,7 @@ chrono             = { version = "0.4", optional = true }
 chrono-tz          = { version = "0.10", optional = true }
 reqwest            = { version = "0.13", default-features = false, features = ["rustls"], optional = true }
 futures-util       = "0.3"
+pulldown-cmark     = { version = "0.13", default-features = false, features = ["html"], optional = true }
 # The one place the fleet's Matrix SDK is defined. The fork copies `m.mentions`
 # into the cleartext wrapper of encrypted events (MSC3952) so that mention
 # push rules fire in encrypted rooms. Bots use `mxbot_common::matrix_sdk`

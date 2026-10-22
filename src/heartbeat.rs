@@ -81,7 +81,10 @@ mod tests {
         write(&file, 42).await.unwrap();
         write(&file, 1_700_000_000).await.unwrap();
 
-        assert_eq!(tokio::fs::read_to_string(&file).await.unwrap(), "1700000000");
+        assert_eq!(
+            tokio::fs::read_to_string(&file).await.unwrap(),
+            "1700000000"
+        );
         assert!(!dir.join(".heartbeat.tmp").exists());
         tokio::fs::remove_dir_all(&dir).await.unwrap();
     }
