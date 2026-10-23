@@ -72,6 +72,9 @@ impl DirectoryConfig {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Person {
     pub username: String,
+    /// The name shown for them (Authentik's `name`; the apps that log in through it, such
+    /// as the wiki, show the same name), trimmed; empty when the directory has none.
+    pub name: String,
     /// The house account first, then the listed ones in their order.
     pub accounts: Vec<OwnedUserId>,
     pub groups: BTreeSet<String>,
@@ -220,6 +223,8 @@ impl Directory {
 #[derive(Deserialize, Debug)]
 struct User {
     username: String,
+    #[serde(default)]
+    name: String,
     #[serde(default = "yes")]
     is_active: bool,
     #[serde(rename = "type", default)]
@@ -259,6 +264,7 @@ fn people_of(users: &[User], cfg: &DirectoryConfig, server_name: &str) -> Vec<Pe
         .filter(|u| u.is_active && !u.kind.contains("service_account"))
         .map(|u| Person {
             username: u.username.clone(),
+            name: u.name.trim().to_owned(),
             accounts: accounts_of(u, cfg, server_name),
             groups: u.groups_obj.iter().map(|g| g.name.clone()).collect(),
         })
@@ -309,7 +315,7 @@ mod tests {
 
     fn people() -> Vec<Person> {
         let users: Vec<User> = serde_json::from_value(serde_json::json!([
-            {"username": "anna", "groups_obj": [{"name": "residents"}, {"name": "kitchen-floor-1"}],
+            {"username": "anna", "name": " Anna Schmidt ", "groups_obj": [{"name": "residents"}, {"name": "kitchen-floor-1"}],
              "attributes": {"matrix_ids": ["@anna:matrix.org", "not an id", "@anna:house.org"]}},
             {"username": "Ben", "groups_obj": [{"name": "kitchen-floor-1"}, {"name": "finance"}],
              "attributes": {"matrix_localpart": "benny", "matrix_ids": "@ben:matrix.org, @ben:example.org"}},
@@ -341,6 +347,8 @@ mod tests {
             p.iter().map(|p| p.username.as_str()).collect::<Vec<_>>(),
             ["anna", "Ben", "cara"]
         );
+        // the shown name, trimmed; none in the directory: empty
+        assert_eq!((p[0].name.as_str(), p[1].name.as_str()), ("Anna Schmidt", ""));
         // the house account first, no duplicates, invalid IDs left out
         assert_eq!(p[0].accounts, ids(&["@anna:house.org", "@anna:matrix.org"]));
         assert_eq!(
