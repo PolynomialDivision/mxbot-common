@@ -432,9 +432,11 @@ impl Rule {
                 .filter_map(|day| NaiveDate::from_ymd_opt(d.year(), d.month(), day))
                 .collect(),
         };
+        // The whole period, also the days before DTSTART (RFC 5545): with them left out, a
+        // series starting on its 3rd Thursday took the month's 5th as its first (2026-10-26).
         let candidates: Vec<NaiveDate> = period
             .into_iter()
-            .filter(|&c| c >= start && self.day_matches(start, c))
+            .filter(|&c| self.day_matches(start, c))
             .collect();
         let Some(index) = candidates.iter().position(|&c| c == d) else {
             return false;
@@ -698,6 +700,26 @@ mod tests {
             61,
         );
         assert_eq!(days, vec![date(2026, 10, 15), date(2026, 11, 19)]);
+    }
+
+    #[test]
+    fn bysetpos_counts_the_days_before_dtstart_in_the_first_month() {
+        // The finance plenum (2026-10-26): from its first date, the 3rd Thursday, not the
+        // 29 October (the 3rd Thursday from DTSTART on).
+        let days = rule_days(
+            "20261015T200000",
+            "FREQ=MONTHLY;BYDAY=TH;BYSETPOS=3",
+            date(2026, 10, 1),
+            61,
+        );
+        assert_eq!(days, vec![date(2026, 10, 15), date(2026, 11, 19)]);
+        let weekly = rule_days(
+            "20261028T090000",
+            "FREQ=WEEKLY;BYDAY=MO,WE,FR;BYSETPOS=2",
+            date(2026, 10, 26),
+            14,
+        );
+        assert_eq!(weekly, vec![date(2026, 10, 28), date(2026, 11, 4)]);
     }
 
     #[test]
