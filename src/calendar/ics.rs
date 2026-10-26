@@ -255,10 +255,13 @@ struct Rule {
     by_month_day: Vec<i32>,
     by_month: Vec<u32>,
     by_set_pos: Vec<i32>,
+    /// WKST, the day weeks begin on (Monday unless the rule says otherwise): Apple's
+    /// calendars write `WKST=SU`, which moves the weeks of an `INTERVAL=2` series.
+    week_start: Weekday,
 }
 
 fn parse_weekday_code(code: &str) -> Option<Weekday> {
-    Some(match code {
+    Some(match code.to_ascii_uppercase().as_str() {
         "MO" => Weekday::Mon,
         "TU" => Weekday::Tue,
         "WE" => Weekday::Wed,
@@ -280,6 +283,7 @@ fn parse_rule(rule: &str) -> Option<Rule> {
         by_month_day: Vec::new(),
         by_month: Vec::new(),
         by_set_pos: Vec::new(),
+        week_start: Weekday::Mon,
     };
     let mut freq = None;
     let list =
@@ -320,6 +324,12 @@ fn parse_rule(rule: &str) -> Option<Rule> {
             "BYMONTHDAY" => parsed.by_month_day = list(value),
             "BYMONTH" => parsed.by_month = list(value).into_iter().map(|m| m as u32).collect(),
             "BYSETPOS" => parsed.by_set_pos = list(value),
+            // An unknown WKST keeps Monday rather than losing the whole series.
+            "WKST" => {
+                if let Some(day) = parse_weekday_code(value.trim()) {
+                    parsed.week_start = day;
+                }
+            }
             _ => {}
         }
     }
@@ -356,16 +366,19 @@ fn month_day_matches(d: NaiveDate, wanted: i32) -> bool {
 }
 
 impl Rule {
+    /// The first day of `d`'s week (WKST).
+    fn week_of(&self, d: NaiveDate) -> NaiveDate {
+        let offset =
+            (d.weekday().num_days_from_monday() + 7 - self.week_start.num_days_from_monday()) % 7;
+        d - Duration::days(offset as i64)
+    }
+
     /// Whether `d` falls in a period the INTERVAL selects.
     fn in_period(&self, start: NaiveDate, d: NaiveDate) -> bool {
         let n = self.interval;
         match self.freq {
             Freq::Daily => (d - start).num_days() % n == 0,
-            Freq::Weekly => {
-                let week =
-                    |x: NaiveDate| x - Duration::days(x.weekday().num_days_from_monday() as i64);
-                ((week(d) - week(start)).num_days() / 7) % n == 0
-            }
+            Freq::Weekly => ((self.week_of(d) - self.week_of(start)).num_days() / 7) % n == 0,
             Freq::Monthly => {
                 let months =
                     (d.year() - start.year()) as i64 * 12 + d.month() as i64 - start.month() as i64;
@@ -425,8 +438,8 @@ impl Rule {
         // for WEEKLY (the common uses).
         let period: Vec<NaiveDate> = match self.freq {
             Freq::Weekly => {
-                let monday = d - Duration::days(d.weekday().num_days_from_monday() as i64);
-                (0..7).map(|i| monday + Duration::days(i)).collect()
+                let first = self.week_of(d);
+                (0..7).map(|i| first + Duration::days(i)).collect()
             }
             _ => (1..=days_in_month(d.year(), d.month()))
                 .filter_map(|day| NaiveDate::from_ymd_opt(d.year(), d.month(), day))
@@ -740,6 +753,38 @@ mod tests {
         assert_eq!(
             days,
             vec![date(2026, 10, 26), date(2026, 10, 27), date(2026, 10, 29)]
+        );
+    }
+
+    #[test]
+    fn wkst_sets_the_weeks_of_an_interval() {
+        // Every other week on Sunday and Tuesday, weeks from Sunday (as Apple writes it): the
+        // Tuesday after the first Sunday is in the same week.
+        let days = rule_days(
+            "20261025T100000",
+            "FREQ=WEEKLY;INTERVAL=2;WKST=SU;BYDAY=SU,TU",
+            date(2026, 10, 25),
+            21,
+        );
+        assert_eq!(
+            days,
+            vec![
+                date(2026, 10, 25),
+                date(2026, 10, 27),
+                date(2026, 11, 8),
+                date(2026, 11, 10)
+            ]
+        );
+        // Weeks from Monday (the default): that Tuesday is in the next week, one not taken.
+        let days = rule_days(
+            "20261025T100000",
+            "FREQ=WEEKLY;INTERVAL=2;BYDAY=SU,TU",
+            date(2026, 10, 25),
+            21,
+        );
+        assert_eq!(
+            days,
+            vec![date(2026, 10, 25), date(2026, 11, 3), date(2026, 11, 8)]
         );
     }
 
