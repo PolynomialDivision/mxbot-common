@@ -561,13 +561,40 @@ fn set_pos_start(rule: &ICalendarRecurrenceRule, first: NaiveDateTime) -> NaiveD
     start.and_time(first.time())
 }
 
+/// Where a rule without COUNT may start instead of DTSTART so that it does not run through
+/// every year since then at each read (a daily series since 1990, an hourly one, 2026-10-26):
+/// a whole number of its periods later, just before `from` (wall clock). Only for periods of
+/// a fixed length (DAILY and finer, WEEKLY), so the phase and what the rule takes from
+/// DTSTART (its weekday, minute, second) stay; MONTHLY and YEARLY rules are cheap from DTSTART.
+fn fast_forward(
+    rule: &ICalendarRecurrenceRule,
+    first: NaiveDateTime,
+    from: NaiveDateTime,
+) -> NaiveDateTime {
+    let unit = match rule.freq {
+        ICalendarFrequency::Weekly => Duration::weeks(1),
+        ICalendarFrequency::Daily => Duration::days(1),
+        ICalendarFrequency::Hourly => Duration::hours(1),
+        ICalendarFrequency::Minutely => Duration::minutes(1),
+        ICalendarFrequency::Secondly => Duration::seconds(1),
+        _ => return first,
+    };
+    if rule.count.is_some() || from <= first {
+        return first;
+    }
+    let step = unit * i32::from(rule.interval.unwrap_or(1).max(1));
+    let periods = (from - first).num_seconds() / step.num_seconds();
+    first + Duration::seconds(periods * step.num_seconds())
+}
+
 impl IcsEvent {
     /// Every start of the event with its length, before EXDATE and replaced occurrences
-    /// are taken out: the rule's from DTSTART up to `up_to` (wall clock, a margin past the
-    /// window), then every RDATE (COUNT does not count them) that is not already one.
-    fn starts(&self, up_to: NaiveDateTime) -> Vec<(Stamp, Span)> {
+    /// are taken out: the rule's from DTSTART (or later, see `fast_forward`: none of those
+    /// before `from` is needed) up to `up_to` (wall clock, margins around the window), then
+    /// every RDATE (COUNT does not count them) that is not already one.
+    fn starts(&self, from: NaiveDateTime, up_to: NaiveDateTime) -> Vec<(Stamp, Span)> {
         let mut starts: Vec<(Stamp, Span)> = self
-            .rule_starts(up_to)
+            .rule_starts(from, up_to)
             .into_iter()
             .map(|s| (s, self.span))
             .collect();
@@ -580,7 +607,7 @@ impl IcsEvent {
         starts
     }
 
-    fn rule_starts(&self, up_to: NaiveDateTime) -> Vec<Stamp> {
+    fn rule_starts(&self, from: NaiveDateTime, up_to: NaiveDateTime) -> Vec<Stamp> {
         let Some(rule) = &self.rule else {
             return vec![self.dtstart];
         };
@@ -589,9 +616,19 @@ impl IcsEvent {
             Stamp::Date(_) => Stamp::Date(wall.date()),
             Stamp::Time { .. } => Stamp::Time { wall, zone },
         };
+        let start = fast_forward(rule, first, from);
+        let ended = rule
+            .until
+            .as_ref()
+            .and_then(|u| until_wall(u, self.dtstart, &self.reader))
+            .is_some_and(|u| u < start);
+        if start > first && ended {
+            // a series that ended before the window: only DTSTART, without rrule's complaint
+            return vec![self.dtstart];
+        }
         let count = rule.count.map(|c| c as usize);
         let mut walls = Vec::new();
-        match rrule_of(rule, self.dtstart, &self.reader).build(carrier(set_pos_start(rule, first)))
+        match rrule_of(rule, self.dtstart, &self.reader).build(carrier(set_pos_start(rule, start)))
         {
             Ok(set) => {
                 for t in &set {
@@ -783,7 +820,21 @@ pub fn expand(events: &[IcsEvent], from: NaiveDate, days: i64) -> Vec<(NaiveDate
         }
         let gone = ev.uid.as_deref().and_then(|uid| replaced.get(uid));
         let changes = ev.uid.as_deref().and_then(|uid| ranges.get(uid));
-        for (start, span) in ev.starts(up_to) {
+        // A THISANDFUTURE change moves starts from outside the window into it, either way:
+        // the window is that much wider. Before it also the occurrence's own length, so one
+        // still running in the window counts (then the margin for the series' zone).
+        let shift = changes
+            .into_iter()
+            .flatten()
+            .filter_map(|c| {
+                let moved = ev.reader.local(c.dtstart.moment()) - ev.reader.local(c.rid?.moment());
+                Some(moved.num_days().abs() + 1)
+            })
+            .max()
+            .unwrap_or(0);
+        let length = ev.span.days + ev.span.exact.num_days() + 1;
+        let first_needed = (from - Duration::days(2 + length + shift)).and_time(NaiveTime::MIN);
+        for (start, span) in ev.starts(first_needed, up_to + Duration::days(shift)) {
             let at = start.moment();
             if ev.exdates.iter().any(|x| ev.reader.same(x.moment(), at))
                 || gone.is_some_and(|g| g.iter().any(|&m| ev.reader.same(m, at)))
@@ -1792,5 +1843,84 @@ mod tests {
             days,
             [date(2026, 10, 26), date(2026, 11, 2), date(2026, 11, 9)]
         );
+    }
+
+    fn choir_moved_by(dtstart: &str) -> String {
+        format!(
+            "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:c\r\nSUMMARY:Choir\r\n\
+             DTSTART;TZID=Europe/Berlin:20261007T200000\r\nRRULE:FREQ=WEEKLY\r\nEND:VEVENT\r\n\
+             BEGIN:VEVENT\r\nUID:c\r\nSUMMARY:Choir (moved)\r\n\
+             RECURRENCE-ID;RANGE=THISANDFUTURE;TZID=Europe/Berlin:20261021T200000\r\n\
+             DTSTART;TZID=Europe/Berlin:{dtstart}\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+        )
+    }
+
+    #[test]
+    fn this_and_future_moves_starts_into_the_window_from_either_side() {
+        let starts = |ics: &str, from, days| -> Vec<NaiveDateTime> {
+            occurrences_of(ics, from, days)
+                .into_iter()
+                .map(|o| o.0)
+                .collect()
+        };
+        // three days earlier: Wednesdays become Sundays; the window's end gets them
+        let earlier = choir_moved_by("20261018T200000");
+        assert_eq!(
+            starts(&earlier, date(2026, 10, 25), 1),
+            [at(2026, 10, 25, 20, 0)]
+        );
+        assert_eq!(
+            starts(&earlier, date(2026, 10, 19), 14),
+            [at(2026, 10, 25, 20, 0), at(2026, 11, 1, 20, 0)]
+        );
+        // ten days later: the window's start gets 28 October's (the rule starts near it)
+        let later = choir_moved_by("20261031T200000");
+        assert_eq!(
+            starts(&later, date(2026, 11, 7), 7),
+            [at(2026, 11, 7, 20, 0)]
+        );
+    }
+
+    #[test]
+    fn long_running_series_start_near_the_window_in_their_phase() {
+        // every 3rd day since 1990, 09:00
+        let every_third = rule_days(
+            "19900101T090000",
+            "FREQ=DAILY;INTERVAL=3",
+            date(2026, 10, 26),
+            9,
+        );
+        let expected: Vec<NaiveDate> = (0..9)
+            .map(|i| date(2026, 10, 26) + Duration::days(i))
+            .filter(|d| (*d - date(1990, 1, 1)).num_days() % 3 == 0)
+            .collect();
+        assert_eq!(every_third, expected);
+        // every other week on Sunday and Tuesday since 2000, weeks from Sunday
+        let biweekly = rule_days(
+            "20000102T100000",
+            "FREQ=WEEKLY;INTERVAL=2;WKST=SU;BYDAY=SU,TU",
+            date(2026, 10, 25),
+            21,
+        );
+        let in_phase = (date(2026, 10, 25) - date(2000, 1, 2)).num_weeks() % 2 == 0;
+        let expected = if in_phase {
+            vec![
+                date(2026, 10, 25),
+                date(2026, 10, 27),
+                date(2026, 11, 8),
+                date(2026, 11, 10),
+            ]
+        } else {
+            vec![date(2026, 11, 1), date(2026, 11, 3)]
+        };
+        assert_eq!(biweekly, expected);
+        // a minute series since 2025: every minute of the window (it was cut, 500000 starts
+        // after DTSTART)
+        let minutely = vevent("UID:m\r\nSUMMARY:S\r\nDTSTART;TZID=Europe/Berlin:20250101T090000\r\nRRULE:FREQ=MINUTELY");
+        let count: usize = expand(&parse_ics_in(&minutely, &berlin()), date(2026, 10, 26), 7)
+            .iter()
+            .map(|(_, e)| e.len())
+            .sum();
+        assert_eq!(count, 7 * 24 * 60);
     }
 }
