@@ -1522,4 +1522,174 @@ mod tests {
         );
         assert!(entries[3].location.as_deref() == Some("Church"));
     }
+
+    // ── Calendars as clients write them (testdata/, 2026-10-26) ─────────────────
+
+    /// "local start|title" of every occurrence in the 150 days from 1 October 2026, read in
+    /// Berlin; the expected lists were checked against recurring-ical-events (Python), which
+    /// differs only where noted.
+    fn listing(ics: &str) -> Vec<String> {
+        let from = date(2026, 10, 1);
+        let mut lines: Vec<String> = expand(&parse_ics_in(ics, &berlin()), from, 150)
+            .into_iter()
+            .flat_map(|(_, entries)| entries)
+            .filter(|e| e.first_day >= from)
+            .map(|e| match e.time {
+                EntryTime::AllDay => format!("{} all-day|{}", e.first_day, e.summary),
+                EntryTime::Timed { .. } => {
+                    format!("{}|{}", e.starts_at.format("%Y-%m-%d %H:%M"), e.summary)
+                }
+            })
+            .collect();
+        lines.sort();
+        lines.dedup();
+        lines
+    }
+
+    #[test]
+    fn nextcloud_third_thursday_with_a_move_an_exdate_and_a_cancellation() {
+        // BYSETPOS=3 from its 3rd Thursday; 19 November moved to the 26th, 19:00; 17 December
+        // excluded; 21 January cancelled by a RECURRENCE-ID with STATUS:CANCELLED.
+        let ics = include_str!("testdata/nextcloud-plenum.ics");
+        assert_eq!(
+            listing(ics),
+            [
+                "2026-10-15 20:00|Finance plenum",
+                "2026-11-26 19:00|Finance plenum (moved)",
+                "2027-02-18 20:00|Finance plenum",
+            ]
+        );
+        // the moved one keeps its key: plenum-bot moves the protocol, it does not make one
+        let keys: Vec<String> = expand(&parse_ics_in(ics, &berlin()), date(2026, 11, 26), 1)[0]
+            .1
+            .iter()
+            .map(|e| e.key.clone())
+            .collect();
+        assert_eq!(keys, ["af94d5c4-c802-4ad1-98b2-d38e488c6437#2026-11-19"]);
+        assert_eq!(
+            parse_ics_in(ics, &berlin())[0].location.as_deref(),
+            Some("Kitchen, 3rd floor")
+        );
+    }
+
+    #[test]
+    fn apple_every_other_week_from_sunday_with_wkst_and_count() {
+        // INTERVAL=2;BYDAY=SU,TU;WKST=SU;COUNT=6 from Sunday 25 October (the DST change
+        // day): the Tuesday after each Sunday is in its week. The alarm's SUMMARY is not
+        // the event's.
+        let ics = include_str!("testdata/apple-biweekly.ics");
+        assert_eq!(
+            listing(ics),
+            [
+                "2026-10-25 10:00|Kitchen cleaning",
+                "2026-10-27 10:00|Kitchen cleaning",
+                "2026-11-08 10:00|Kitchen cleaning",
+                "2026-11-10 10:00|Kitchen cleaning",
+                "2026-11-22 10:00|Kitchen cleaning",
+                "2026-11-24 10:00|Kitchen cleaning",
+            ]
+        );
+    }
+
+    #[test]
+    fn outlook_windows_zone_until_exdate_and_a_moved_occurrence() {
+        // TZID "W. Europe Standard Time"; UNTIL 26 November 19:00Z is that day's 20:00
+        // (winter), so it is the last; 5 November excluded; 12 November moved to Friday the
+        // 13th, 18:00, with its own title. The UID is folded over two lines.
+        let ics = include_str!("testdata/outlook-weekly.ics");
+        assert_eq!(
+            listing(ics),
+            [
+                "2026-10-22 20:00|Jour fixe",
+                "2026-10-29 20:00|Jour fixe",
+                "2026-11-13 18:00|Jour fixe (Freitag)",
+                "2026-11-19 20:00|Jour fixe",
+                "2026-11-26 20:00|Jour fixe",
+            ]
+        );
+    }
+
+    #[test]
+    fn google_utc_series_across_dst_with_count_exdate_and_a_yearly_day() {
+        // 18:00Z: 20:00 before 25 October, 19:00 after; COUNT=4 counts the excluded 5
+        // November; a birthday since 1990, all day.
+        let ics = include_str!("testdata/google-utc.ics");
+        assert_eq!(
+            listing(ics),
+            [
+                "2026-10-22 20:00|Board call",
+                "2026-10-29 19:00|Board call",
+                "2026-10-29 all-day|Ben's birthday",
+                "2026-11-12 19:00|Board call",
+            ]
+        );
+    }
+
+    #[test]
+    fn thunderbird_daily_count_with_exdates_in_utc_and_in_the_zone() {
+        // COUNT=5 from 23 October across the DST change; 24 October excluded by a UTC
+        // EXDATE (07:00Z is 09:00 in summer time), the 26th by one in Berlin time.
+        let ics = include_str!("testdata/daily-count-exdate.ics");
+        assert_eq!(
+            listing(ics),
+            [
+                "2026-10-23 09:00|Standup",
+                "2026-10-25 09:00|Standup",
+                "2026-10-27 09:00|Standup",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_new_york_series_read_in_berlin() {
+        // 14:00 in New York: 20:00 here, 19:00 in the week between the two DST changes.
+        let ics = include_str!("testdata/new-york.ics");
+        assert_eq!(
+            listing(ics),
+            [
+                "2026-10-22 20:00|Call with Sam",
+                "2026-10-29 19:00|Call with Sam",
+                "2026-11-05 20:00|Call with Sam",
+                "2026-11-12 20:00|Call with Sam",
+            ]
+        );
+    }
+
+    #[test]
+    fn thunderbird_rdates_with_exdate_period_day_and_a_moved_rdate() {
+        // The 1st Tuesdays (COUNT=3) and RDATEs: 20 October (moved to 18:00 in the yard),
+        // 10 November (excluded), a period on the 24th (17:00Z, 18:00 here), the 28th as a
+        // day. recurring-ical-events makes that day midnight; here it is all day.
+        let ics = include_str!("testdata/thunderbird-rdate.ics");
+        assert_eq!(
+            listing(ics),
+            [
+                "2026-10-06 19:00|Repair café",
+                "2026-10-20 18:00|Repair café (yard)",
+                "2026-11-03 19:00|Repair café",
+                "2026-11-24 18:00|Repair café",
+                "2026-11-28 all-day|Repair café",
+                "2026-12-01 19:00|Repair café",
+            ]
+        );
+    }
+
+    #[test]
+    fn this_and_future_from_a_caldav_client() {
+        // From 28 October on Thursdays 19:30 instead of Wednesdays 20:00; 11 November (its
+        // original date) cancelled; COUNT=8 ends with the 25th, moved to the 26th.
+        let ics = include_str!("testdata/this-and-future.ics");
+        assert_eq!(
+            listing(ics),
+            [
+                "2026-10-07 20:00|Choir",
+                "2026-10-14 20:00|Choir",
+                "2026-10-21 20:00|Choir",
+                "2026-10-29 19:30|Choir (Thursdays)",
+                "2026-11-05 19:30|Choir (Thursdays)",
+                "2026-11-19 19:30|Choir (Thursdays)",
+                "2026-11-26 19:30|Choir (Thursdays)",
+            ]
+        );
+    }
 }
