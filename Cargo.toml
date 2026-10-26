@@ -9,7 +9,7 @@ default = []
 # Forwards matrix-sdk's test helpers for bots whose tests mock a homeserver.
 testing = ["matrix-sdk/testing"]
 # iCalendar and CalDAV (src/calendar): calendar-bot, plenum-bot.
-calendar = ["dep:chrono", "dep:chrono-tz", "dep:reqwest"]
+calendar = ["dep:calcard", "dep:chrono", "dep:chrono-tz", "dep:reqwest", "dep:rrule"]
 # The house's directory (src/directory.rs): plenum-bot, cleaning-bot.
 directory = ["dep:reqwest"]
 # Markdown messages (format::markdown): plenum-bot, health-bot.
@@ -17,8 +17,11 @@ markdown = ["dep:pulldown-cmark"]
 
 [dependencies]
 anyhow             = "1"
+# iCalendar reading (time zones, VTIMEZONE, Windows names) and recurrence rules (src/calendar/ics.rs).
+calcard            = { version = "0.3", default-features = false, optional = true }
 chrono             = { version = "0.4", optional = true }
 chrono-tz          = { version = "0.10", optional = true }
+rrule              = { version = "0.14", optional = true }
 reqwest            = { version = "0.13", default-features = false, features = ["rustls"], optional = true }
 futures-util       = "0.3"
 pulldown-cmark     = { version = "0.13", default-features = false, features = ["html"], optional = true }
