@@ -15,10 +15,12 @@ import recurring_ical_events
 path, start, days = sys.argv[1], dt.date.fromisoformat(sys.argv[2]), int(sys.argv[3])
 zone = zoneinfo.ZoneInfo(sys.argv[4] if len(sys.argv) > 4 else "Europe/Berlin")
 with open(path, "rb") as f:
-    cal = icalendar.Calendar.from_ical(f.read())
+    # several VCALENDARs, as a CalDAV query returns them (one per event and its changes)
+    cals = icalendar.Calendar.from_ical(f.read(), multiple=True)
 end = start + dt.timedelta(days=days)
 lines = set()
-for ev in recurring_ical_events.of(cal).between(start, end):
+events = [ev for cal in cals for ev in recurring_ical_events.of(cal).between(start, end)]
+for ev in events:
     # recurring-ical-events returns cancelled occurrences too; calendars do not show them
     if str(ev.get("STATUS", "")).upper() == "CANCELLED":
         continue

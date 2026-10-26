@@ -1692,4 +1692,44 @@ mod tests {
             ]
         );
     }
+
+    // ── The house's own calendar (Nextcloud, 2026-10-26) ─────────────────────────
+
+    #[test]
+    fn the_real_house_plenum_calendar_from_nextcloud() {
+        // plenum-house as plenum-bot's CalDAV query returned it on 26 October 2026, made in
+        // Thunderbird: three VCALENDARs with Mozilla's long VTIMEZONE, series of the 1st,
+        // 3rd and 5th Sunday 19:00 (titles and UIDs replaced, nothing else changed). Two
+        // series start on Saturday 31 October, off their rule, and exclude that date with an
+        // EXDATE (so DTSTART counting as an occurrence adds nothing); the 3rd Sunday's first
+        // date, 18 October, is moved to the 25th.
+        let ics = include_str!("testdata/nextcloud-house-plenum-real.ics");
+        let from = date(2026, 9, 26);
+        let days = 431; // plenum-bot's window: 30 days back, 400 ahead
+        let got: Vec<(NaiveDateTime, String)> = expand(&parse_ics_in(ics, &berlin()), from, days)
+            .into_iter()
+            .flat_map(|(_, entries)| entries)
+            .map(|e| (e.starts_at, e.key))
+            .collect();
+        // every 1st, 3rd and 5th Sunday from 1 November, and the moved 18 October
+        let mut expected = vec![(
+            at(2026, 10, 25, 19, 0),
+            "uid-9ec5c26b#2026-10-18".to_owned(),
+        )];
+        let mut d = date(2026, 11, 1);
+        while d < from + Duration::days(days) {
+            let nth = (d.day() - 1) / 7 + 1;
+            if nth % 2 == 1 {
+                let uid = match nth {
+                    1 => "uid-a17779dd",
+                    3 => "uid-9ec5c26b",
+                    _ => "uid-617e3ca2",
+                };
+                expected.push((d.and_hms_opt(19, 0, 0).unwrap(), format!("{uid}#{d}")));
+            }
+            d += Duration::days(7);
+        }
+        assert_eq!(got, expected);
+        assert_eq!(got.len(), 32);
+    }
 }
