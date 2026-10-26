@@ -186,7 +186,12 @@ impl Span {
         exact: Duration::zero(),
     };
 
-    fn of(start: Stamp, end: Option<Stamp>, duration: Option<&ICalendarDuration>) -> Span {
+    fn of(
+        start: Stamp,
+        end: Option<Stamp>,
+        duration: Option<&ICalendarDuration>,
+        reader: &Reader,
+    ) -> Span {
         match (start, end) {
             (Stamp::Date(s), Some(Stamp::Date(e))) => Span {
                 days: (e - s).num_days().max(1),
@@ -196,14 +201,8 @@ impl Span {
             (Stamp::Time { .. }, Some(end @ Stamp::Time { .. })) => {
                 let exact = match (start.moment(), end.moment()) {
                     (Moment::At(s), Moment::At(e)) => e - s,
-                    (s, e) => {
-                        let wall = |m| match m {
-                            Moment::Wall(w) => w,
-                            Moment::At(t) => t.naive_utc(),
-                            Moment::Day(d) => d.and_time(NaiveTime::MIN),
-                        };
-                        wall(e) - wall(s)
-                    }
+                    // a floating time beside a fixed one: both as read
+                    (s, e) => reader.local(e) - reader.local(s),
                 };
                 Span {
                     days: 0,
@@ -325,6 +324,7 @@ fn event_of(
     let mut summary = None;
     let mut location = None;
     let mut cancelled = false;
+    // A property given twice: the first counts, as it did before calcard.
     for entry in &comp.entries {
         let first = entry.values.first();
         let first_stamp = || match first {
@@ -332,9 +332,9 @@ fn event_of(
             _ => None,
         };
         match (&entry.name, first) {
-            (ICalendarProperty::Dtstart, _) => dtstart = first_stamp(),
-            (ICalendarProperty::Dtend, _) => dtend = first_stamp(),
-            (ICalendarProperty::RecurrenceId, _) => {
+            (ICalendarProperty::Dtstart, _) if dtstart.is_none() => dtstart = first_stamp(),
+            (ICalendarProperty::Dtend, _) if dtend.is_none() => dtend = first_stamp(),
+            (ICalendarProperty::RecurrenceId, _) if rid.is_none() => {
                 rid = first_stamp();
                 // calcard reads RANGE=THISANDFUTURE as true (THISANDPRIOR is gone, RFC 5545)
                 this_and_future = entry.params.iter().any(|p| {
@@ -342,7 +342,9 @@ fn event_of(
                         && matches!(p.value, ICalendarParameterValue::Bool(true))
                 });
             }
-            (ICalendarProperty::Duration, Some(ICalendarValue::Duration(d))) => {
+            (ICalendarProperty::Duration, Some(ICalendarValue::Duration(d)))
+                if duration.is_none() =>
+            {
                 duration = Some(d.clone())
             }
             // more than one RRULE (deprecated in RFC 5545): the first
@@ -356,12 +358,12 @@ fn event_of(
                     ICalendarValue::PartialDateTime(t) => Some((stamp(t, entry, zones)?, None)),
                     ICalendarValue::Period(ICalendarPeriod::Range { start, end }) => {
                         let start = stamp(start, entry, zones)?;
-                        let span = Span::of(start, stamp(end, entry, zones), None);
+                        let span = Span::of(start, stamp(end, entry, zones), None, reader);
                         Some((start, Some(span)))
                     }
                     ICalendarValue::Period(ICalendarPeriod::Duration { start, duration }) => {
                         let start = stamp(start, entry, zones)?;
-                        Some((start, Some(Span::of(start, None, Some(duration)))))
+                        Some((start, Some(Span::of(start, None, Some(duration), reader))))
                     }
                     _ => None,
                 }))
@@ -372,13 +374,16 @@ fn event_of(
                     _ => None,
                 }))
             }
-            (ICalendarProperty::Uid, _) => uid = text(first),
-            (ICalendarProperty::Summary, _) => summary = text(first),
-            (ICalendarProperty::Location, _) => location = text(first),
-            (
-                ICalendarProperty::Status,
-                Some(ICalendarValue::Status(ICalendarStatus::Cancelled)),
-            ) => cancelled = true,
+            (ICalendarProperty::Uid, _) if uid.is_none() => uid = text(first),
+            (ICalendarProperty::Summary, _) if summary.is_none() => summary = text(first),
+            (ICalendarProperty::Location, _) if location.is_none() => location = text(first),
+            // calcard knows "CANCELLED", not " CANCELLED" or "cancelled ": by its text
+            (ICalendarProperty::Status, _) => {
+                cancelled = matches!(
+                    first,
+                    Some(ICalendarValue::Status(ICalendarStatus::Cancelled))
+                ) || text(first).is_some_and(|s| s.eq_ignore_ascii_case("CANCELLED"))
+            }
             _ => {}
         }
     }
@@ -397,7 +402,7 @@ fn event_of(
         recurrence_id: rid.map(|r| reader.local(r.moment()).date()),
         cancelled,
         dtstart,
-        span: Span::of(dtstart, dtend, duration.as_ref()),
+        span: Span::of(dtstart, dtend, duration.as_ref(), reader),
         rule,
         rdates,
         exdates,
@@ -1731,5 +1736,41 @@ mod tests {
         }
         assert_eq!(got, expected);
         assert_eq!(got.len(), 32);
+    }
+
+    // ── Review findings (2026-10-26) ─────────────────────────────────────────────
+
+    #[test]
+    fn the_first_of_a_repeated_property_counts_and_status_is_read_leniently() {
+        let ics = vevent(
+            "UID:a\r\nUID:b\r\nSUMMARY:First\r\nSUMMARY:Second\r\nDTSTART:20261026T100000\r\n\
+             DTSTART:20261027T100000",
+        );
+        let ev = &parse_ics_in(&ics, &berlin())[0];
+        assert_eq!(
+            (ev.uid.as_deref(), ev.summary.as_str()),
+            (Some("a"), "First")
+        );
+        assert_eq!(ev.start, IcsTime::DateTime(at(2026, 10, 26, 10, 0)));
+        for status in ["STATUS: CANCELLED", "STATUS:cancelled", "STATUS:CANCELLED "] {
+            let ics = vevent(&format!(
+                "UID:c\r\nSUMMARY:S\r\nDTSTART:20261026T100000\r\n{status}"
+            ));
+            assert!(parse_ics_in(&ics, &berlin())[0].cancelled, "{status}");
+        }
+    }
+
+    #[test]
+    fn a_floating_start_with_a_utc_end_is_read_in_the_zone() {
+        // 10:00 floating to 11:00Z (12:00 in Berlin in winter): two hours
+        let ics = vevent("UID:f\r\nSUMMARY:S\r\nDTSTART:20261026T100000\r\nDTEND:20261026T110000Z");
+        let day = expand(&parse_ics_in(&ics, &berlin()), date(2026, 10, 26), 1);
+        assert_eq!(
+            day[0].1[0].time,
+            EntryTime::Timed {
+                start: NaiveTime::from_hms_opt(10, 0, 0).unwrap(),
+                end: NaiveTime::from_hms_opt(12, 0, 0),
+            }
+        );
     }
 }
