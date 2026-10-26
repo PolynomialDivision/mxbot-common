@@ -86,13 +86,6 @@ pub struct IcsEvent {
     reader: Reader,
 }
 
-impl IcsEvent {
-    /// Whether it has more than one occurrence (its keys carry their dates).
-    fn is_series(&self) -> bool {
-        self.rule.is_some() || !self.rdates.is_empty()
-    }
-}
-
 /// A DATE or DATE-TIME as the calendar wrote it: a day, or a wall-clock time in its zone
 /// (UTC, a fixed offset, a named zone or floating).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -709,10 +702,59 @@ impl DayEntry {
 struct Occurrence<'a> {
     /// Whose title, place and length it has.
     event: &'a IcsEvent,
-    /// The series' date it stands for (its key), in the zone the calendar is read in.
-    original: NaiveDate,
+    /// Its `DayEntry::key` (None: no UID, the title and start then).
+    key: Option<String>,
     start: Stamp,
     span: Span,
+}
+
+/// A series (or single event) with its starts before EXDATE and RECURRENCE-ID take any.
+struct Series<'a> {
+    event: &'a IcsEvent,
+    starts: Vec<(Stamp, Span)>,
+    /// How many start on each local date: more than one, and their keys carry the time.
+    per_date: HashMap<NaiveDate, usize>,
+}
+
+/// The key of the occurrence originally due at `original` of the series with `uid` (`series`:
+/// its own event, if read). Stable when it moves: the UID of a single event (also for an
+/// event's own DTSTART beside RDATEs, as before RDATE was read); the UID and the local date
+/// for one of a series, with the local time if the series has more than one start on that
+/// date (BYHOUR, HOURLY, a UTC series near midnight across a DST change), so that no two
+/// occurrences share a key (2026-10-26).
+fn key_of(uid: &str, series: Option<&Series>, original: Moment, reader: &Reader) -> String {
+    let local = reader.local(original);
+    match series {
+        Some(s) if s.event.rule.is_none() && reader.same(s.event.dtstart.moment(), original) => {
+            uid.to_owned()
+        }
+        Some(s) if s.per_date.get(&local.date()).is_some_and(|&n| n > 1) => {
+            format!("{uid}#{}T{}", local.date(), local.format("%H:%M"))
+        }
+        _ => format!("{uid}#{}", local.date()),
+    }
+}
+
+/// Which of `starts` an EXDATE or RECURRENCE-ID at `m` takes: those at that moment (a day:
+/// those on it). If none is, the one on the same local date when it is the only one there:
+/// they matched by date before 2026-10-26, and a client that changes a series' time may keep
+/// the old IDs of its exceptions.
+fn taken(reader: &Reader, starts: &[Moment], m: Moment) -> Vec<usize> {
+    let exact: Vec<usize> = (0..starts.len())
+        .filter(|&i| reader.same(starts[i], m))
+        .collect();
+    if !exact.is_empty() {
+        return exact;
+    }
+    let date = reader.local(m).date();
+    let on: Vec<usize> = (0..starts.len())
+        .filter(|&i| reader.local(starts[i]).date() == date)
+        .collect();
+    if on.len() == 1 {
+        on
+    } else {
+        Vec::new()
+    }
 }
 
 impl Occurrence<'_> {
@@ -801,24 +843,10 @@ pub fn expand(events: &[IcsEvent], from: NaiveDate, days: i64) -> Vec<(NaiveDate
         }
     }
 
-    let mut occurrences = Vec::new();
-    for ev in events {
-        if let Some(rid) = ev.rid {
-            // a moved or changed occurrence is an event of its own; a cancelled one is gone
-            if !ev.cancelled {
-                occurrences.push(Occurrence {
-                    event: ev,
-                    original: ev.reader.local(rid.moment()).date(),
-                    start: ev.dtstart,
-                    span: ev.span,
-                });
-            }
-            continue;
-        }
-        if ev.cancelled {
-            continue;
-        }
-        let gone = ev.uid.as_deref().and_then(|uid| replaced.get(uid));
+    // First every series' starts (the keys of its moved occurrences depend on them), then
+    // the occurrences.
+    let mut series: Vec<Series> = Vec::new();
+    for ev in events.iter().filter(|ev| ev.rid.is_none() && !ev.cancelled) {
         let changes = ev.uid.as_deref().and_then(|uid| ranges.get(uid));
         // A THISANDFUTURE change moves starts from outside the window into it, either way:
         // the window is that much wider. Before it also the occurrence's own length, so one
@@ -834,14 +862,68 @@ pub fn expand(events: &[IcsEvent], from: NaiveDate, days: i64) -> Vec<(NaiveDate
             .unwrap_or(0);
         let length = ev.span.days + ev.span.exact.num_days() + 1;
         let first_needed = (from - Duration::days(2 + length + shift)).and_time(NaiveTime::MIN);
-        for (start, span) in ev.starts(first_needed, up_to + Duration::days(shift)) {
-            let at = start.moment();
-            if ev.exdates.iter().any(|x| ev.reader.same(x.moment(), at))
-                || gone.is_some_and(|g| g.iter().any(|&m| ev.reader.same(m, at)))
-            {
+        let starts = ev.starts(first_needed, up_to + Duration::days(shift));
+        let mut per_date: HashMap<NaiveDate, usize> = HashMap::new();
+        for (start, _) in &starts {
+            *per_date
+                .entry(ev.reader.local(start.moment()).date())
+                .or_default() += 1;
+        }
+        series.push(Series {
+            event: ev,
+            starts,
+            per_date,
+        });
+    }
+    let mut series_of: HashMap<&str, usize> = HashMap::new();
+    for (i, s) in series.iter().enumerate() {
+        if let Some(uid) = s.event.uid.as_deref() {
+            series_of.entry(uid).or_insert(i);
+        }
+    }
+
+    let mut occurrences = Vec::new();
+    // a moved or changed occurrence is an event of its own; a cancelled one is gone
+    for ev in events.iter().filter(|ev| !ev.cancelled) {
+        let Some(rid) = ev.rid else {
+            continue;
+        };
+        let key = ev.uid.as_deref().map(|uid| {
+            let own = series_of.get(uid).map(|&i| &series[i]);
+            key_of(uid, own, rid.moment(), &ev.reader)
+        });
+        occurrences.push(Occurrence {
+            event: ev,
+            key,
+            start: ev.dtstart,
+            span: ev.span,
+        });
+    }
+    for s in &series {
+        let ev = s.event;
+        let changes = ev.uid.as_deref().and_then(|uid| ranges.get(uid));
+        let ats: Vec<Moment> = s.starts.iter().map(|(start, _)| start.moment()).collect();
+        let mut dropped = vec![false; ats.len()];
+        let gone = ev.uid.as_deref().and_then(|uid| replaced.get(uid));
+        for m in ev
+            .exdates
+            .iter()
+            .map(|x| x.moment())
+            .chain(gone.into_iter().flatten().copied())
+        {
+            for i in taken(&ev.reader, &ats, m) {
+                dropped[i] = true;
+            }
+        }
+        for (i, &(start, span)) in s.starts.iter().enumerate() {
+            if dropped[i] {
                 continue;
             }
-            let original = ev.reader.local(at).date();
+            let at = ats[i];
+            let key = ev
+                .uid
+                .as_deref()
+                .map(|uid| key_of(uid, Some(s), at, &ev.reader));
             let change = changes
                 .into_iter()
                 .flatten()
@@ -852,7 +934,7 @@ pub fn expand(events: &[IcsEvent], from: NaiveDate, days: i64) -> Vec<(NaiveDate
             occurrences.push(match change {
                 None => Occurrence {
                     event: ev,
-                    original,
+                    key,
                     start,
                     span,
                 },
@@ -860,7 +942,7 @@ pub fn expand(events: &[IcsEvent], from: NaiveDate, days: i64) -> Vec<(NaiveDate
                 Some(c) if c.cancelled => continue,
                 Some(c) => Occurrence {
                     event: c,
-                    original,
+                    key,
                     start: shifted(start, c, &ev.reader),
                     span: c.span,
                 },
@@ -884,11 +966,9 @@ pub fn expand(events: &[IcsEvent], from: NaiveDate, days: i64) -> Vec<(NaiveDate
         )) {
             continue;
         }
-        let key = match ev.uid.as_deref() {
-            Some(uid) if ev.rid.is_some() || ev.is_series() => format!("{uid}#{}", occ.original),
-            Some(uid) => uid.to_owned(),
-            None => format!("{}#{starts_at}", ev.summary),
-        };
+        let key = occ
+            .key
+            .unwrap_or_else(|| format!("{}#{starts_at}", ev.summary));
         let entry = DayEntry {
             time,
             summary: ev.summary.clone(),
@@ -1500,7 +1580,8 @@ mod tests {
                 (at(2026, 11, 28, 0, 0), None, "r#2026-11-28".to_owned()),
             ]
         );
-        // an event with RDATEs alone is a series too (its keys carry the date)
+        // an event with RDATEs alone: its DTSTART keeps the UID as its key (as before RDATE
+        // was read), the RDATEs' carry their date
         let only = vevent(
             "UID:o\r\nSUMMARY:Extra\r\nDTSTART;TZID=Europe/Berlin:20261006T190000\r\n\
              RDATE;TZID=Europe/Berlin:20261008T190000",
@@ -1509,7 +1590,7 @@ mod tests {
             .into_iter()
             .map(|o| o.2)
             .collect();
-        assert_eq!(keys, ["o#2026-10-06", "o#2026-10-08"]);
+        assert_eq!(keys, ["o", "o#2026-10-08"]);
     }
 
     #[test]
@@ -1528,7 +1609,7 @@ mod tests {
         assert_eq!(
             starts,
             [
-                (at(2026, 10, 6, 19, 0), "r#2026-10-06".to_owned()),
+                (at(2026, 10, 6, 19, 0), "r".to_owned()),
                 (at(2026, 10, 20, 18, 0), "r#2026-10-20".to_owned()),
             ]
         );
@@ -1922,5 +2003,84 @@ mod tests {
             .map(|(_, e)| e.len())
             .sum();
         assert_eq!(count, 7 * 24 * 60);
+    }
+
+    /// Every key over `days` from `from`, read in Berlin, each once per occurrence.
+    fn keys_of(ics: &str, from: NaiveDate, days: i64) -> Vec<String> {
+        occurrences_of(ics, from, days)
+            .into_iter()
+            .map(|o| o.2)
+            .collect()
+    }
+
+    #[test]
+    fn no_two_occurrences_share_a_key() {
+        // twice a day: the keys carry the time; once a day: only the date, as before
+        let twice = vevent(
+            "UID:h\r\nSUMMARY:S\r\nDTSTART;TZID=Europe/Berlin:20261020T090000\r\n\
+             RRULE:FREQ=DAILY;BYHOUR=9,15",
+        );
+        assert_eq!(
+            keys_of(&twice, date(2026, 10, 26), 2),
+            [
+                "h#2026-10-26T09:00",
+                "h#2026-10-26T15:00",
+                "h#2026-10-27T09:00",
+                "h#2026-10-27T15:00"
+            ]
+        );
+        // a daily UTC series near midnight: on 25 October (the DST change) it starts at
+        // 00:30 and at 23:30 in Berlin
+        let utc = vevent("UID:u\r\nSUMMARY:S\r\nDTSTART:20261020T223000Z\r\nRRULE:FREQ=DAILY");
+        let keys = keys_of(&utc, date(2026, 10, 24), 3);
+        assert_eq!(
+            keys,
+            [
+                "u#2026-10-24",
+                "u#2026-10-25T00:30",
+                "u#2026-10-25T23:30",
+                "u#2026-10-26"
+            ]
+        );
+        // a moved one of those keeps the key of the occurrence it replaces
+        let moved = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:h\r\nSUMMARY:S\r\n\
+             DTSTART;TZID=Europe/Berlin:20261020T090000\r\nRRULE:FREQ=DAILY;BYHOUR=9,15\r\nEND:VEVENT\r\n\
+             BEGIN:VEVENT\r\nUID:h\r\nSUMMARY:S\r\nRECURRENCE-ID;TZID=Europe/Berlin:20261026T150000\r\n\
+             DTSTART;TZID=Europe/Berlin:20261026T170000\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        assert_eq!(
+            keys_of(moved, date(2026, 10, 26), 1),
+            ["h#2026-10-26T09:00", "h#2026-10-26T15:00"]
+        );
+    }
+
+    #[test]
+    fn exceptions_with_the_old_time_of_a_changed_series_still_apply() {
+        // The series was moved from 19:00 to 20:00 and the client kept its exceptions' IDs
+        // at 19:00: the 11th moved to the 12th, the 18th cancelled, the 25th excluded. Each
+        // takes the series' only occurrence on its date (as before 2026-10-26).
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:s\r\nSUMMARY:Plenum\r\n\
+            DTSTART;TZID=Europe/Berlin:20261004T200000\r\nRRULE:FREQ=WEEKLY\r\n\
+            EXDATE;TZID=Europe/Berlin:20261025T190000\r\nEND:VEVENT\r\n\
+            BEGIN:VEVENT\r\nUID:s\r\nSUMMARY:Plenum\r\nRECURRENCE-ID;TZID=Europe/Berlin:20261011T190000\r\n\
+            DTSTART;TZID=Europe/Berlin:20261012T190000\r\nEND:VEVENT\r\n\
+            BEGIN:VEVENT\r\nUID:s\r\nSUMMARY:Plenum\r\nRECURRENCE-ID;TZID=Europe/Berlin:20261018T190000\r\n\
+            DTSTART;TZID=Europe/Berlin:20261018T190000\r\nSTATUS:CANCELLED\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let got: Vec<(NaiveDateTime, String)> = occurrences_of(ics, date(2026, 10, 4), 28)
+            .into_iter()
+            .map(|(s, _, k)| (s, k))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (at(2026, 10, 4, 20, 0), "s#2026-10-04".to_owned()),
+                (at(2026, 10, 12, 19, 0), "s#2026-10-11".to_owned()),
+            ]
+        );
+        // with two occurrences on that date it takes none (which one would be a guess)
+        let twice = vevent(
+            "UID:t\r\nSUMMARY:S\r\nDTSTART;TZID=Europe/Berlin:20261020T090000\r\n\
+             RRULE:FREQ=DAILY;BYHOUR=9,15\r\nEXDATE;TZID=Europe/Berlin:20261026T120000",
+        );
+        assert_eq!(keys_of(&twice, date(2026, 10, 26), 1).len(), 2);
     }
 }
