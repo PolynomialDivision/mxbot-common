@@ -452,7 +452,9 @@ impl Rule {
 /// Start dates of a series from `start` up to and including `up_to`, in
 /// order, honouring UNTIL (compared as a moment: "…T235959Z" can end a
 /// series before a morning occurrence on the next local day) and COUNT
-/// (which counts before EXDATE removal, as RFC 5545 specifies).
+/// (which counts before EXDATE removal, as RFC 5545 specifies). DTSTART is always the first
+/// occurrence, also off the rule (a Monday event repeated on Tuesdays and Thursdays): so
+/// RFC 5545 and Nextcloud have it.
 fn occurrence_dates(start: IcsTime, rule: &Rule, up_to: NaiveDate) -> Vec<NaiveDate> {
     let time_of_day = match start {
         IcsTime::DateTime(dt) => dt.time(),
@@ -468,7 +470,10 @@ fn occurrence_dates(start: IcsTime, rule: &Rule, up_to: NaiveDate) -> Vec<NaiveD
     let mut produced = 0usize;
     let mut d = start;
     while d <= up_to && within_until(d) {
-        if rule.in_period(start, d) && rule.day_matches(start, d) && rule.set_pos_matches(start, d)
+        if d == start
+            || (rule.in_period(start, d)
+                && rule.day_matches(start, d)
+                && rule.set_pos_matches(start, d))
         {
             produced += 1;
             if rule.count.is_some_and(|c| produced > c) {
@@ -720,6 +725,22 @@ mod tests {
             14,
         );
         assert_eq!(weekly, vec![date(2026, 10, 28), date(2026, 11, 4)]);
+    }
+
+    #[test]
+    fn dtstart_is_the_first_occurrence_also_off_the_rule() {
+        // A Monday event repeated on Tuesdays and Thursdays: Nextcloud shows the Monday, and
+        // COUNT counts it.
+        let days = rule_days(
+            "20261026T190000",
+            "FREQ=WEEKLY;BYDAY=TU,TH;COUNT=3",
+            date(2026, 10, 26),
+            14,
+        );
+        assert_eq!(
+            days,
+            vec![date(2026, 10, 26), date(2026, 10, 27), date(2026, 10, 29)]
+        );
     }
 
     #[test]
