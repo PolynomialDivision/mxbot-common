@@ -14,7 +14,8 @@
 //! country's zone keeps its hour across that zone's DST changes, not ours. DTSTART is always
 //! the first occurrence and `COUNT` counts it, `UNTIL` is a moment (a day for all-day
 //! series), `RDATE` adds occurrences (times, days, periods with their own length), `EXDATE`
-//! removes any and a `RECURRENCE-ID` replaces one (moved, changed or `STATUS:CANCELLED`).
+//! removes any and a `RECURRENCE-ID` replaces one (moved, changed or `STATUS:CANCELLED`),
+//! with `RANGE=THISANDFUTURE` also the ones after it.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -26,8 +27,9 @@ use calcard::{
     common::{timezone::Tz as Zone, PartialDateTime},
     icalendar::{
         timezone::TzResolver, ICalendar, ICalendarComponent, ICalendarComponentType,
-        ICalendarDuration, ICalendarEntry, ICalendarFrequency, ICalendarPeriod, ICalendarProperty,
-        ICalendarRecurrenceRule, ICalendarStatus, ICalendarValue, ICalendarWeekday,
+        ICalendarDuration, ICalendarEntry, ICalendarFrequency, ICalendarParameterName,
+        ICalendarParameterValue, ICalendarPeriod, ICalendarProperty, ICalendarRecurrenceRule,
+        ICalendarStatus, ICalendarValue, ICalendarWeekday,
     },
     Entry, Parser,
 };
@@ -79,6 +81,8 @@ pub struct IcsEvent {
     rdates: Vec<(Stamp, Option<Span>)>,
     exdates: Vec<Stamp>,
     rid: Option<Stamp>,
+    /// `RECURRENCE-ID;RANGE=THISANDFUTURE`: also the occurrences after `rid` change.
+    this_and_future: bool,
     reader: Reader,
 }
 
@@ -316,6 +320,7 @@ fn event_of(
     let mut rdates = Vec::new();
     let mut exdates = Vec::new();
     let mut rid = None;
+    let mut this_and_future = false;
     let mut uid = None;
     let mut summary = None;
     let mut location = None;
@@ -329,7 +334,14 @@ fn event_of(
         match (&entry.name, first) {
             (ICalendarProperty::Dtstart, _) => dtstart = first_stamp(),
             (ICalendarProperty::Dtend, _) => dtend = first_stamp(),
-            (ICalendarProperty::RecurrenceId, _) => rid = first_stamp(),
+            (ICalendarProperty::RecurrenceId, _) => {
+                rid = first_stamp();
+                // calcard reads RANGE=THISANDFUTURE as true (THISANDPRIOR is gone, RFC 5545)
+                this_and_future = entry.params.iter().any(|p| {
+                    p.name == ICalendarParameterName::Range
+                        && matches!(p.value, ICalendarParameterValue::Bool(true))
+                });
+            }
             (ICalendarProperty::Duration, Some(ICalendarValue::Duration(d))) => {
                 duration = Some(d.clone())
             }
@@ -390,6 +402,7 @@ fn event_of(
         rdates,
         exdates,
         rid,
+        this_and_future,
         reader: reader.clone(),
     })
 }
@@ -689,6 +702,34 @@ impl Occurrence<'_> {
     }
 }
 
+/// `start` moved as a THISANDFUTURE change moved its own occurrence (RFC 5545 §3.8.4.4), by
+/// the wall clock of `start`'s zone: 20:00 to 19:30 stays 19:30 across a DST change.
+fn shifted(start: Stamp, change: &IcsEvent, reader: &Reader) -> Stamp {
+    let Some(rid) = change.rid else {
+        return start;
+    };
+    let zone = match start {
+        Stamp::Date(_) => Zone::Floating,
+        Stamp::Time { zone, .. } => zone,
+    };
+    let wall = |s: Stamp| match (s, s.moment()) {
+        (Stamp::Date(d), _) => d.and_time(NaiveTime::MIN),
+        (Stamp::Time { wall, zone: z }, _) if z == zone => wall,
+        (_, Moment::At(t)) if !zone.is_floating() => {
+            zone.from_utc_datetime(&t.naive_utc()).naive_local()
+        }
+        (_, m) => reader.local(m),
+    };
+    let delta = wall(change.dtstart) - wall(rid);
+    match start {
+        Stamp::Date(d) => Stamp::Date(d + Duration::days(delta.num_days())),
+        Stamp::Time { wall, zone } => Stamp::Time {
+            wall: wall + delta,
+            zone,
+        },
+    }
+}
+
 /// Every event occurring on each of the `days` days starting at `from`,
 /// sorted within the day. Occurrences listed by several calendars (same UID
 /// and start) appear once.
@@ -701,6 +742,14 @@ pub fn expand(events: &[IcsEvent], from: NaiveDate, days: i64) -> Vec<(NaiveDate
     for ev in events {
         if let (Some(uid), Some(rid)) = (ev.uid.as_deref(), ev.rid) {
             replaced.entry(uid).or_default().push(rid.moment());
+        }
+    }
+
+    // RANGE=THISANDFUTURE: the occurrences after it changed too, the latest such change wins.
+    let mut ranges: HashMap<&str, Vec<&IcsEvent>> = HashMap::new();
+    for ev in events.iter().filter(|ev| ev.this_and_future) {
+        if let Some(uid) = ev.uid.as_deref() {
+            ranges.entry(uid).or_default().push(ev);
         }
     }
 
@@ -722,6 +771,7 @@ pub fn expand(events: &[IcsEvent], from: NaiveDate, days: i64) -> Vec<(NaiveDate
             continue;
         }
         let gone = ev.uid.as_deref().and_then(|uid| replaced.get(uid));
+        let changes = ev.uid.as_deref().and_then(|uid| ranges.get(uid));
         for (start, span) in ev.starts(up_to) {
             let at = start.moment();
             if ev.exdates.iter().any(|x| ev.reader.same(x.moment(), at))
@@ -729,11 +779,29 @@ pub fn expand(events: &[IcsEvent], from: NaiveDate, days: i64) -> Vec<(NaiveDate
             {
                 continue;
             }
-            occurrences.push(Occurrence {
-                event: ev,
-                original: ev.reader.local(at).date(),
-                start,
-                span,
+            let original = ev.reader.local(at).date();
+            let change = changes
+                .into_iter()
+                .flatten()
+                .filter_map(|c| Some((ev.reader.local(c.rid?.moment()), *c)))
+                .filter(|(from, _)| *from < ev.reader.local(at))
+                .max_by_key(|(from, _)| *from)
+                .map(|(_, c)| c);
+            occurrences.push(match change {
+                None => Occurrence {
+                    event: ev,
+                    original,
+                    start,
+                    span,
+                },
+                // cancelled from there on
+                Some(c) if c.cancelled => continue,
+                Some(c) => Occurrence {
+                    event: c,
+                    original,
+                    start: shifted(start, c, &ev.reader),
+                    span: c.span,
+                },
             });
         }
     }
@@ -1402,5 +1470,56 @@ mod tests {
                 (at(2026, 10, 20, 18, 0), "r#2026-10-20".to_owned()),
             ]
         );
+    }
+
+    #[test]
+    fn this_and_future_changes_the_later_occurrences_too() {
+        // Wednesdays 20:00; from 21 October on Thursdays 19:30 in the church (the shift is
+        // the wall clock's, so it stays 19:30 after the DST change on 25 October); a later
+        // single change still wins; from 25 November on cancelled.
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:c\r\nSUMMARY:Choir\r\n\
+            DTSTART;TZID=Europe/Berlin:20261007T200000\r\nRRULE:FREQ=WEEKLY;COUNT=10\r\nEND:VEVENT\r\n\
+            BEGIN:VEVENT\r\nUID:c\r\nSUMMARY:Choir (Thursdays)\r\nLOCATION:Church\r\n\
+            RECURRENCE-ID;RANGE=THISANDFUTURE;TZID=Europe/Berlin:20261021T200000\r\n\
+            DTSTART;TZID=Europe/Berlin:20261022T193000\r\nEND:VEVENT\r\n\
+            BEGIN:VEVENT\r\nUID:c\r\nSUMMARY:Choir (concert)\r\n\
+            RECURRENCE-ID;TZID=Europe/Berlin:20261111T200000\r\n\
+            DTSTART;TZID=Europe/Berlin:20261114T180000\r\nEND:VEVENT\r\n\
+            BEGIN:VEVENT\r\nUID:c\r\nSUMMARY:Choir\r\nSTATUS:CANCELLED\r\n\
+            RECURRENCE-ID;RANGE=THISANDFUTURE;TZID=Europe/Berlin:20261125T200000\r\n\
+            DTSTART;TZID=Europe/Berlin:20261125T200000\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let entries: Vec<DayEntry> = expand(&parse_ics_in(ics, &berlin()), date(2026, 10, 1), 90)
+            .into_iter()
+            .flat_map(|(_, entries)| entries)
+            .collect();
+        let got: Vec<(NaiveDateTime, &str, &str)> = entries
+            .iter()
+            .map(|e| (e.starts_at, e.summary.as_str(), e.key.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (at(2026, 10, 7, 20, 0), "Choir", "c#2026-10-07"),
+                (at(2026, 10, 14, 20, 0), "Choir", "c#2026-10-14"),
+                (
+                    at(2026, 10, 22, 19, 30),
+                    "Choir (Thursdays)",
+                    "c#2026-10-21"
+                ),
+                (
+                    at(2026, 10, 29, 19, 30),
+                    "Choir (Thursdays)",
+                    "c#2026-10-28"
+                ),
+                (at(2026, 11, 5, 19, 30), "Choir (Thursdays)", "c#2026-11-04"),
+                (at(2026, 11, 14, 18, 0), "Choir (concert)", "c#2026-11-11"),
+                (
+                    at(2026, 11, 19, 19, 30),
+                    "Choir (Thursdays)",
+                    "c#2026-11-18"
+                ),
+            ]
+        );
+        assert!(entries[3].location.as_deref() == Some("Church"));
     }
 }
