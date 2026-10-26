@@ -13,8 +13,8 @@
 //! a time in the zone the calendar is read in. A series written in UTC or in another
 //! country's zone keeps its hour across that zone's DST changes, not ours. DTSTART is always
 //! the first occurrence and `COUNT` counts it, `UNTIL` is a moment (a day for all-day
-//! series), `EXDATE` removes occurrences and a `RECURRENCE-ID` replaces one (moved, changed
-//! or `STATUS:CANCELLED`).
+//! series), `RDATE` adds occurrences (times, days, periods with their own length), `EXDATE`
+//! removes any and a `RECURRENCE-ID` replaces one (moved, changed or `STATUS:CANCELLED`).
 
 use std::{
     collections::{HashMap, HashSet},
@@ -26,7 +26,7 @@ use calcard::{
     common::{timezone::Tz as Zone, PartialDateTime},
     icalendar::{
         timezone::TzResolver, ICalendar, ICalendarComponent, ICalendarComponentType,
-        ICalendarDuration, ICalendarEntry, ICalendarFrequency, ICalendarProperty,
+        ICalendarDuration, ICalendarEntry, ICalendarFrequency, ICalendarPeriod, ICalendarProperty,
         ICalendarRecurrenceRule, ICalendarStatus, ICalendarValue, ICalendarWeekday,
     },
     Entry, Parser,
@@ -75,6 +75,8 @@ pub struct IcsEvent {
     dtstart: Stamp,
     span: Span,
     rule: Option<ICalendarRecurrenceRule>,
+    /// RDATE: further starts, a period's with its own length.
+    rdates: Vec<(Stamp, Option<Span>)>,
     exdates: Vec<Stamp>,
     rid: Option<Stamp>,
     reader: Reader,
@@ -83,7 +85,7 @@ pub struct IcsEvent {
 impl IcsEvent {
     /// Whether it has more than one occurrence (its keys carry their dates).
     fn is_series(&self) -> bool {
-        self.rule.is_some()
+        self.rule.is_some() || !self.rdates.is_empty()
     }
 }
 
@@ -311,6 +313,7 @@ fn event_of(
     let mut dtend = None;
     let mut duration = None;
     let mut rule = None;
+    let mut rdates = Vec::new();
     let mut exdates = Vec::new();
     let mut rid = None;
     let mut uid = None;
@@ -335,6 +338,21 @@ fn event_of(
                 if rule.is_none() =>
             {
                 rule = Some((**r).clone())
+            }
+            (ICalendarProperty::Rdate, _) => {
+                rdates.extend(entry.values.iter().filter_map(|v| match v {
+                    ICalendarValue::PartialDateTime(t) => Some((stamp(t, entry, zones)?, None)),
+                    ICalendarValue::Period(ICalendarPeriod::Range { start, end }) => {
+                        let start = stamp(start, entry, zones)?;
+                        let span = Span::of(start, stamp(end, entry, zones), None);
+                        Some((start, Some(span)))
+                    }
+                    ICalendarValue::Period(ICalendarPeriod::Duration { start, duration }) => {
+                        let start = stamp(start, entry, zones)?;
+                        Some((start, Some(Span::of(start, None, Some(duration)))))
+                    }
+                    _ => None,
+                }))
             }
             (ICalendarProperty::Exdate, _) => {
                 exdates.extend(entry.values.iter().filter_map(|v| match v {
@@ -369,6 +387,7 @@ fn event_of(
         dtstart,
         span: Span::of(dtstart, dtend, duration.as_ref()),
         rule,
+        rdates,
         exdates,
         rid,
         reader: reader.clone(),
@@ -519,9 +538,25 @@ fn set_pos_start(rule: &ICalendarRecurrenceRule, first: NaiveDateTime) -> NaiveD
 }
 
 impl IcsEvent {
-    /// Every start of the event from its first up to `up_to` (wall clock, a margin past the
-    /// window), before EXDATE and replaced occurrences are taken out.
-    fn starts(&self, up_to: NaiveDateTime) -> Vec<Stamp> {
+    /// Every start of the event with its length, before EXDATE and replaced occurrences
+    /// are taken out: the rule's from DTSTART up to `up_to` (wall clock, a margin past the
+    /// window), then every RDATE (COUNT does not count them) that is not already one.
+    fn starts(&self, up_to: NaiveDateTime) -> Vec<(Stamp, Span)> {
+        let mut starts: Vec<(Stamp, Span)> = self
+            .rule_starts(up_to)
+            .into_iter()
+            .map(|s| (s, self.span))
+            .collect();
+        for &(rdate, span) in &self.rdates {
+            let at = rdate.moment();
+            if !starts.iter().any(|(s, _)| self.reader.same(s.moment(), at)) {
+                starts.push((rdate, span.unwrap_or(self.span)));
+            }
+        }
+        starts
+    }
+
+    fn rule_starts(&self, up_to: NaiveDateTime) -> Vec<Stamp> {
         let Some(rule) = &self.rule else {
             return vec![self.dtstart];
         };
@@ -687,7 +722,7 @@ pub fn expand(events: &[IcsEvent], from: NaiveDate, days: i64) -> Vec<(NaiveDate
             continue;
         }
         let gone = ev.uid.as_deref().and_then(|uid| replaced.get(uid));
-        for start in ev.starts(up_to) {
+        for (start, span) in ev.starts(up_to) {
             let at = start.moment();
             if ev.exdates.iter().any(|x| ev.reader.same(x.moment(), at))
                 || gone.is_some_and(|g| g.iter().any(|&m| ev.reader.same(m, at)))
@@ -698,7 +733,7 @@ pub fn expand(events: &[IcsEvent], from: NaiveDate, days: i64) -> Vec<(NaiveDate
                 event: ev,
                 original: ev.reader.local(at).date(),
                 start,
-                span: ev.span,
+                span,
             });
         }
     }
@@ -1291,5 +1326,81 @@ mod tests {
         let events = parse_ics(ics);
         let names: Vec<&str> = events.iter().map(|e| e.summary.as_str()).collect();
         assert_eq!(names, ["Kept", "Second"]);
+    }
+
+    /// (start, end, key) of every occurrence, read in Berlin.
+    fn occurrences_of(
+        ics: &str,
+        from: NaiveDate,
+        days: i64,
+    ) -> Vec<(NaiveDateTime, Option<NaiveTime>, String)> {
+        let mut out: Vec<_> = expand(&parse_ics_in(ics, &berlin()), from, days)
+            .into_iter()
+            .flat_map(|(_, entries)| entries)
+            .map(|e| {
+                let end = match e.time {
+                    EntryTime::Timed { end, .. } => end,
+                    EntryTime::AllDay => None,
+                };
+                (e.starts_at, end, e.key)
+            })
+            .collect();
+        out.dedup();
+        out
+    }
+
+    #[test]
+    fn rdates_add_times_periods_and_days() {
+        // Two Tuesdays by the rule (COUNT=2 does not count RDATEs), a time, a period with its
+        // own length, a day (all-day), one RDATE that is a rule date anyway.
+        let ics = vevent(
+            "UID:r\r\nSUMMARY:Café\r\nDTSTART;TZID=Europe/Berlin:20261006T190000\r\n\
+             DTEND;TZID=Europe/Berlin:20261006T210000\r\nRRULE:FREQ=MONTHLY;COUNT=2;BYDAY=1TU\r\n\
+             RDATE;TZID=Europe/Berlin:20261020T190000,20261103T190000\r\n\
+             RDATE;VALUE=PERIOD:20261124T170000Z/PT3H\r\nRDATE;VALUE=DATE:20261128",
+        );
+        let t = |h, m| NaiveTime::from_hms_opt(h, m, 0);
+        assert_eq!(
+            occurrences_of(&ics, date(2026, 10, 1), 90),
+            [
+                (at(2026, 10, 6, 19, 0), t(21, 0), "r#2026-10-06".to_owned()),
+                (at(2026, 10, 20, 19, 0), t(21, 0), "r#2026-10-20".to_owned()),
+                (at(2026, 11, 3, 19, 0), t(21, 0), "r#2026-11-03".to_owned()),
+                (at(2026, 11, 24, 18, 0), t(21, 0), "r#2026-11-24".to_owned()),
+                (at(2026, 11, 28, 0, 0), None, "r#2026-11-28".to_owned()),
+            ]
+        );
+        // an event with RDATEs alone is a series too (its keys carry the date)
+        let only = vevent(
+            "UID:o\r\nSUMMARY:Extra\r\nDTSTART;TZID=Europe/Berlin:20261006T190000\r\n\
+             RDATE;TZID=Europe/Berlin:20261008T190000",
+        );
+        let keys: Vec<String> = occurrences_of(&only, date(2026, 10, 1), 30)
+            .into_iter()
+            .map(|o| o.2)
+            .collect();
+        assert_eq!(keys, ["o#2026-10-06", "o#2026-10-08"]);
+    }
+
+    #[test]
+    fn exdate_and_replaced_occurrences_apply_to_rdates() {
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:r\r\nSUMMARY:Café\r\n\
+            DTSTART;TZID=Europe/Berlin:20261006T190000\r\n\
+            RDATE;TZID=Europe/Berlin:20261013T190000,20261020T190000\r\n\
+            EXDATE;TZID=Europe/Berlin:20261013T190000\r\nEND:VEVENT\r\n\
+            BEGIN:VEVENT\r\nUID:r\r\nSUMMARY:Café (yard)\r\n\
+            RECURRENCE-ID;TZID=Europe/Berlin:20261020T190000\r\n\
+            DTSTART;TZID=Europe/Berlin:20261020T180000\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let starts: Vec<(NaiveDateTime, String)> = occurrences_of(ics, date(2026, 10, 1), 30)
+            .into_iter()
+            .map(|(s, _, k)| (s, k))
+            .collect();
+        assert_eq!(
+            starts,
+            [
+                (at(2026, 10, 6, 19, 0), "r#2026-10-06".to_owned()),
+                (at(2026, 10, 20, 18, 0), "r#2026-10-20".to_owned()),
+            ]
+        );
     }
 }
