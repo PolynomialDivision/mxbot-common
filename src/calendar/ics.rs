@@ -482,12 +482,18 @@ fn rrule_of(rule: &ICalendarRecurrenceRule, start: Stamp, reader: &Reader) -> RR
         r = r.week_start(weekday(day));
     }
     if !rule.byday.is_empty() {
+        // An ordinal ("1MO") only means something in a MONTHLY or YEARLY rule (RFC 5545);
+        // elsewhere rrule drops the whole BYDAY and a weekly rule ran daily: the weekday.
+        let ordinals = matches!(
+            rule.freq,
+            ICalendarFrequency::Monthly | ICalendarFrequency::Yearly
+        );
         r = r.by_weekday(
             rule.byday
                 .iter()
                 .map(|d| match d.ordwk {
-                    Some(n) => NWeekday::Nth(n, weekday(d.weekday)),
-                    None => NWeekday::Every(weekday(d.weekday)),
+                    Some(n) if ordinals => NWeekday::Nth(n, weekday(d.weekday)),
+                    _ => NWeekday::Every(weekday(d.weekday)),
                 })
                 .collect(),
         );
@@ -1771,6 +1777,20 @@ mod tests {
                 start: NaiveTime::from_hms_opt(10, 0, 0).unwrap(),
                 end: NaiveTime::from_hms_opt(12, 0, 0),
             }
+        );
+    }
+
+    #[test]
+    fn an_ordinal_byday_outside_monthly_and_yearly_is_its_weekday() {
+        let days = rule_days(
+            "20261026T100000",
+            "FREQ=WEEKLY;BYDAY=1MO;COUNT=3",
+            date(2026, 10, 26),
+            21,
+        );
+        assert_eq!(
+            days,
+            [date(2026, 10, 26), date(2026, 11, 2), date(2026, 11, 9)]
         );
     }
 }
