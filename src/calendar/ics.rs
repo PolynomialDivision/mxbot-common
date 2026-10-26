@@ -58,13 +58,23 @@ fn unfold(ics: &str) -> String {
         .replace("\n\t", "")
 }
 
-/// Unescape ICS text values (commas, semicolons, newlines, backslashes).
+/// Unescape ICS text values (commas, semicolons, newlines, backslashes), in one pass: `\\n`
+/// is a backslash and an n, not a newline.
 fn unescape(s: &str) -> String {
-    s.replace("\\n", "\n")
-        .replace("\\N", "\n")
-        .replace("\\,", ",")
-        .replace("\\;", ";")
-        .replace("\\\\", "\\")
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n' | 'N') => out.push('\n'),
+            Some(other) => out.push(other),
+            None => out.push('\\'),
+        }
+    }
+    out
 }
 
 /// Value of `NAME=value` among `;`-separated property parameters.
@@ -786,6 +796,14 @@ mod tests {
             days,
             vec![date(2026, 10, 25), date(2026, 11, 3), date(2026, 11, 8)]
         );
+    }
+
+    #[test]
+    fn an_escaped_backslash_before_n_is_no_newline() {
+        let ev = &parse_ics(&vevent(
+            "UID:x\r\nSUMMARY:C:\\\\new\\, now\\nnext\r\nDTSTART:20261027T100000",
+        ))[0];
+        assert_eq!(ev.summary, "C:\\new, now\nnext");
     }
 
     #[test]
