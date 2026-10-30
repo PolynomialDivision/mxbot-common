@@ -12,17 +12,21 @@
 //! Long-polling sync returns at least every sync timeout (30 s by default),
 //! so the file stays fresh even when nothing happens. Without the variable
 //! nothing is written. Write errors are logged once and never stop the bot.
+//!
+//! While a loop started with [`crate::supervise::supervise_ticking`] has not
+//! ticked in its time, the file is not refreshed: a hung loop makes the health
+//! check fail as a dead sync does. Logged when the set of stalled loops changes.
 
 use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
-        OnceLock,
+        Mutex, OnceLock,
     },
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use tracing::warn;
+use tracing::{info, warn};
 
 /// Environment variable naming the heartbeat file, e.g. `/app/store/.heartbeat`.
 pub const HEARTBEAT_ENV: &str = "MXBOT_HEARTBEAT_FILE";
@@ -39,8 +43,12 @@ fn configured_path() -> Option<&'static PathBuf> {
     .as_ref()
 }
 
-/// Record a successful sync, if a heartbeat file is configured.
+/// Record a successful sync, if a heartbeat file is configured and no supervised loop is
+/// stalled.
 pub async fn beat() {
+    if withheld() {
+        return;
+    }
     let Some(path) = configured_path() else {
         return;
     };
@@ -49,6 +57,27 @@ pub async fn beat() {
             warn!(path = %path.display(), %error, "Failed to write heartbeat file (further errors suppressed)");
         }
     }
+}
+
+/// True while a ticking loop is stalled; says so when that changes.
+fn withheld() -> bool {
+    static LAST: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let stalled = crate::supervise::stalled();
+    let names: Vec<String> = stalled.iter().map(|(name, _)| name.clone()).collect();
+    let mut last = LAST.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if *last != names {
+        if names.is_empty() {
+            info!("Background tasks ticking again; heartbeat resumed");
+        } else {
+            let detail: Vec<String> = stalled
+                .iter()
+                .map(|(name, secs)| format!("{name} ({secs} s without a round)"))
+                .collect();
+            warn!(stalled = %detail.join(", "), "Background task stalled; heartbeat withheld");
+        }
+        *last = names;
+    }
+    !last.is_empty()
 }
 
 /// Write `secs` to `path` atomically (temporary file plus rename), so a

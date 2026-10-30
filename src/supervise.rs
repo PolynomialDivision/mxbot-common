@@ -1,0 +1,214 @@
+//! Supervised background tasks: a bot's loops that must run as long as the bot does.
+//!
+//! A loop spawned with plain `tokio::spawn` can end (a bug, a closed channel, a panic caught
+//! by tokio) while the sync keeps the heartbeat fresh: the container stays "healthy" and the
+//! bot is half dead. Spawned with [`supervise`] instead, its end, error or panic is logged and
+//! ends the process; the container's restart policy starts the bot again, and health-bot sees
+//! the restart. Bots build with `panic = "abort"` too, so a panic anywhere does the same.
+//!
+//! A loop that works in rounds (every minute, every few minutes) can also hang, waiting for an
+//! answer that never comes. [`supervise_ticking`] gives it an [`Alive`] to [`tick`](Alive::tick)
+//! once per round: when no tick came for the given time, [`crate::heartbeat`] stops refreshing
+//! the heartbeat file, the health check fails and health-bot reports the container unhealthy.
+//! A loop that sleeps until a date (a monthly summary) uses [`supervise`] without ticks.
+//!
+//! Not for tasks that end by design (per request, one-shot, a test mode that posts once).
+
+use std::{
+    future::Future,
+    sync::{Arc, Mutex, OnceLock},
+    time::{Duration, Instant},
+};
+
+use tokio::task::JoinHandle;
+use tracing::{error, info};
+
+/// How a supervised task ended: `()` or a `Result` whose error is shown.
+pub trait TaskEnd {
+    fn describe(self) -> String;
+}
+
+impl TaskEnd for () {
+    fn describe(self) -> String {
+        "returned".to_owned()
+    }
+}
+
+impl<E: std::fmt::Display> TaskEnd for Result<(), E> {
+    fn describe(self) -> String {
+        match self {
+            Ok(()) => "returned".to_owned(),
+            Err(e) => format!("failed: {e:#}"),
+        }
+    }
+}
+
+/// Run `task` for the rest of the bot's life: if it ever ends, returns an error or panics, the
+/// process exits (status 1) and the container is restarted.
+pub fn supervise<Fut>(name: impl Into<String>, task: Fut) -> JoinHandle<()>
+where
+    Fut: Future + Send + 'static,
+    Fut::Output: TaskEnd + Send,
+{
+    watch(name.into(), task, exit)
+}
+
+/// As [`supervise`], for a loop that works in rounds: `task` gets an [`Alive`] to tick once
+/// per round. No tick for `within` (counted from the start, then from the last tick): the
+/// heartbeat stops until the next tick. Choose `within` well above a round's longest normal
+/// duration plus its pause.
+pub fn supervise_ticking<F, Fut>(
+    name: impl Into<String>,
+    within: Duration,
+    task: F,
+) -> JoinHandle<()>
+where
+    F: FnOnce(Alive) -> Fut,
+    Fut: Future + Send + 'static,
+    Fut::Output: TaskEnd + Send,
+{
+    let name = name.into();
+    let alive = register(name.clone(), within);
+    watch(name, task(alive), exit)
+}
+
+/// A ticking task's handle: [`tick`](Self::tick) once per round of its loop.
+#[derive(Clone, Debug)]
+pub struct Alive(Arc<Slot>);
+
+impl Alive {
+    /// The task finished a round (or is still making progress in a long one).
+    pub fn tick(&self) {
+        *lock(&self.0.last) = Instant::now();
+    }
+}
+
+#[derive(Debug)]
+struct Slot {
+    name: String,
+    within: Duration,
+    last: Mutex<Instant>,
+}
+
+fn slots() -> &'static Mutex<Vec<Arc<Slot>>> {
+    static SLOTS: OnceLock<Mutex<Vec<Arc<Slot>>>> = OnceLock::new();
+    SLOTS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn register(name: String, within: Duration) -> Alive {
+    let slot = Arc::new(Slot {
+        name,
+        within,
+        last: Mutex::new(Instant::now()),
+    });
+    lock(slots()).push(Arc::clone(&slot));
+    Alive(slot)
+}
+
+/// The ticking tasks without a tick within their time, with the seconds since their last one.
+pub fn stalled() -> Vec<(String, u64)> {
+    stalled_at(Instant::now())
+}
+
+fn stalled_at(now: Instant) -> Vec<(String, u64)> {
+    lock(slots())
+        .iter()
+        .filter_map(|slot| {
+            let quiet = now.saturating_duration_since(*lock(&slot.last));
+            (quiet > slot.within).then(|| (slot.name.clone(), quiet.as_secs()))
+        })
+        .collect()
+}
+
+/// A poisoned lock still holds a usable value here (an Instant, a list of slots).
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The task in a task of its own (so a panic is seen even when it unwinds), then `on_end`.
+fn watch<Fut>(name: String, task: Fut, on_end: fn(&str, &str)) -> JoinHandle<()>
+where
+    Fut: Future + Send + 'static,
+    Fut::Output: TaskEnd + Send,
+{
+    tokio::spawn(async move {
+        info!(task = %name, "Background task started");
+        let how = match tokio::spawn(task).await {
+            Ok(output) => output.describe(),
+            Err(e) if e.is_panic() => "panicked".to_owned(),
+            Err(e) => format!("was cancelled: {e}"),
+        };
+        on_end(&name, &how);
+    })
+}
+
+fn exit(name: &str, how: &str) {
+    error!(task = %name, "Background task {how}; exiting so that the container is restarted");
+    std::process::exit(1);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    static ENDED: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+
+    fn record(name: &str, how: &str) {
+        lock(&ENDED).push((name.to_owned(), how.to_owned()));
+    }
+
+    fn ended(name: &str) -> Option<String> {
+        lock(&ENDED)
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, how)| how.clone())
+    }
+
+    #[tokio::test]
+    async fn every_way_of_ending_is_seen() {
+        watch("returns".into(), async {}, record).await.unwrap();
+        watch(
+            "fails".into(),
+            async { Err::<(), _>(anyhow::anyhow!("no answer")) },
+            record,
+        )
+        .await
+        .unwrap();
+        watch("panics".into(), async { panic!("bug") as () }, record)
+            .await
+            .unwrap();
+        assert_eq!(ended("returns").as_deref(), Some("returned"));
+        assert_eq!(ended("fails").as_deref(), Some("failed: no answer"));
+        assert_eq!(ended("panics").as_deref(), Some("panicked"));
+    }
+
+    #[tokio::test]
+    async fn a_running_task_is_not_ended() {
+        let handle = watch("runs".into(), std::future::pending::<()>(), record);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!handle.is_finished());
+        assert_eq!(ended("runs"), None);
+        handle.abort();
+    }
+
+    #[test]
+    fn a_task_without_a_tick_in_time_is_stalled_until_it_ticks() {
+        let alive = register("ticker under test".into(), Duration::from_secs(60));
+        let mine = |at| {
+            stalled_at(at)
+                .into_iter()
+                .find(|(name, _)| name == "ticker under test")
+        };
+        let now = Instant::now();
+        assert_eq!(mine(now), None);
+        assert_eq!(mine(now + Duration::from_secs(59)), None);
+        assert_eq!(
+            mine(now + Duration::from_secs(61)).map(|(_, secs)| secs >= 61),
+            Some(true)
+        );
+        alive.tick();
+        assert_eq!(mine(Instant::now() + Duration::from_secs(30)), None);
+    }
+}
