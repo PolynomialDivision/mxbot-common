@@ -14,6 +14,13 @@ calendar = ["dep:calcard", "dep:chrono", "dep:chrono-tz", "dep:reqwest", "dep:rr
 directory = ["dep:reqwest"]
 # Markdown messages (format::markdown): plenum-bot, health-bot.
 markdown = ["dep:pulldown-cmark"]
+# Time zone and DST rule (src/clock.rs), scheduled jobs (src/schedule.rs): calendar-bot, radar-bot.
+schedule = ["dep:chrono", "dep:chrono-tz"]
+# SQLite stores with numbered migrations (src/sqlite.rs): kummerkasten-bot, schnaeppchenjaeger-bot.
+sqlite = ["dep:rusqlite"]
+# Forward-auth identity and the page language of the bots' websites (src/web.rs):
+# cleaning-bot, schnaeppchenjaeger-bot.
+web = ["dep:http", "dep:subtle"]
 
 [dependencies]
 anyhow             = "1"
@@ -24,6 +31,10 @@ chrono-tz          = { version = "0.10", optional = true }
 rrule              = { version = "0.14", optional = true }
 reqwest            = { version = "0.13", default-features = false, features = ["rustls"], optional = true }
 futures-util       = "0.3"
+# The type of a file sent with `media` (the SDK takes it); already in the tree through matrix-sdk.
+mime               = "0.3"
+# Request headers of the websites (web); axum's HeaderMap is this one.
+http               = { version = "1", optional = true }
 pulldown-cmark     = { version = "0.13", default-features = false, features = ["html"], optional = true }
 # The one place the fleet's Matrix SDK is defined. The fork copies `m.mentions`
 # into the cleartext wrapper of encrypted events (MSC3952) so that mention
@@ -31,9 +42,17 @@ pulldown-cmark     = { version = "0.13", default-features = false, features = ["
 # instead of declaring (and patching) the SDK themselves.
 matrix-sdk         = { git = "https://github.com/PolynomialDivision/matrix-rust-sdk", branch = "msc3952-mentions-encrypted-0.19", features = ["e2e-encryption", "sqlite", "automatic-room-key-forwarding"] }
 matrix-sdk-crypto  = { git = "https://github.com/PolynomialDivision/matrix-rust-sdk", branch = "msc3952-mentions-encrypted-0.19" }
+# SQLite stores (sqlite): the version the SDK's sqlite store already links; no bundled build here.
+rusqlite           = { version = "0.40", default-features = false, optional = true }
 serde              = { version = "1", features = ["derive"] }
+# Stable transaction IDs (send::txn_for); the SDK has it already.
+sha2               = "0.10"
 serde_json         = "1"
-tokio              = { version = "1", features = ["fs", "macros", "rt", "signal", "sync", "time"] }
+# The proxy secret compared in constant time (web); already in the tree through vodozemac.
+subtle             = { version = "2.6", optional = true }
+# Names unknown config keys (config::load_toml), so a typo does not silently keep a default.
+serde_ignored      = "0.1"
+tokio              = { version = "1", features = ["fs", "io-util", "macros", "rt", "signal", "sync", "time"] }
 toml               = "1"
 tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

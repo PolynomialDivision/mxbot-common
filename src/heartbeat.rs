@@ -14,8 +14,10 @@
 //! nothing is written. Write errors are logged once and never stop the bot.
 //!
 //! While a loop started with [`crate::supervise::supervise_ticking`] has not
-//! ticked in its time, the file is not refreshed: a hung loop makes the health
-//! check fail as a dead sync does. Logged when the set of stalled loops changes.
+//! ticked in its time, or has failed every round for longer than that, the file
+//! is not refreshed: the health check fails as for a dead sync, and
+//! `<file>.reason` names the loop and why (the check can print it). Logged when
+//! the set of unhealthy loops changes.
 
 use std::{
     path::{Path, PathBuf},
@@ -44,49 +46,74 @@ fn configured_path() -> Option<&'static PathBuf> {
 }
 
 /// Record a successful sync, if a heartbeat file is configured and no supervised loop is
-/// stalled.
+/// unhealthy. While one is, the file is left alone and `<file>.reason` says which and why
+/// (for the health check's output); it is removed once all are healthy again.
 pub async fn beat() {
-    if withheld() {
-        return;
-    }
+    let unhealthy = crate::supervise::unhealthy();
+    log_change(&unhealthy);
     let Some(path) = configured_path() else {
         return;
     };
-    if let Err(error) = write(path, unix_now_secs()).await {
-        if !WARNED.swap(true, Ordering::Relaxed) {
-            warn!(path = %path.display(), %error, "Failed to write heartbeat file (further errors suppressed)");
+    let reason = sibling(path, "reason");
+    if !unhealthy.is_empty() {
+        let text: Vec<String> = unhealthy
+            .iter()
+            .map(|u| format!("{}: {}", u.name, u.why))
+            .collect();
+        if let Err(error) = write(&reason, &text.join("; ")).await {
+            warn_once(path, &error);
         }
+        return;
+    }
+    match tokio::fs::remove_file(&reason).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => warn_once(path, &error),
+    }
+    if let Err(error) = write(path, &unix_now_secs().to_string()).await {
+        warn_once(path, &error);
     }
 }
 
-/// True while a ticking loop is stalled; says so when that changes.
-fn withheld() -> bool {
+fn warn_once(path: &Path, error: &std::io::Error) {
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        warn!(path = %path.display(), %error, "Failed to write heartbeat file (further errors suppressed)");
+    }
+}
+
+/// Say so when the set of unhealthy loops changes (not at every sync).
+fn log_change(unhealthy: &[crate::supervise::Unhealthy]) {
     static LAST: Mutex<Vec<String>> = Mutex::new(Vec::new());
-    let stalled = crate::supervise::stalled();
-    let names: Vec<String> = stalled.iter().map(|(name, _)| name.clone()).collect();
+    let names: Vec<String> = unhealthy.iter().map(|u| u.name.clone()).collect();
     let mut last = LAST.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    if *last != names {
-        if names.is_empty() {
-            info!("Background tasks ticking again; heartbeat resumed");
-        } else {
-            let detail: Vec<String> = stalled
-                .iter()
-                .map(|(name, secs)| format!("{name} ({secs} s without a round)"))
-                .collect();
-            warn!(stalled = %detail.join(", "), "Background task stalled; heartbeat withheld");
-        }
-        *last = names;
+    if *last == names {
+        return;
     }
-    !last.is_empty()
+    if names.is_empty() {
+        info!("Background tasks healthy again; heartbeat resumed");
+    } else {
+        let detail: Vec<String> = unhealthy
+            .iter()
+            .map(|u| format!("{} ({})", u.name, u.why))
+            .collect();
+        warn!(unhealthy = %detail.join(", "), "Background task unhealthy; heartbeat withheld");
+    }
+    *last = names;
 }
 
-/// Write `secs` to `path` atomically (temporary file plus rename), so a
+/// `path` with `.suffix` appended to its file name.
+fn sibling(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".");
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+/// Write `text` to `path` atomically (temporary file plus rename), so a
 /// health check never reads a half-written value.
-async fn write(path: &Path, secs: u64) -> std::io::Result<()> {
-    let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
-    let tmp = PathBuf::from(tmp);
-    tokio::fs::write(&tmp, secs.to_string()).await?;
+async fn write(path: &Path, text: &str) -> std::io::Result<()> {
+    let tmp = sibling(path, "tmp");
+    tokio::fs::write(&tmp, text).await?;
     tokio::fs::rename(&tmp, path).await
 }
 
@@ -107,8 +134,8 @@ mod tests {
         tokio::fs::create_dir_all(&dir).await.unwrap();
         let file = dir.join(".heartbeat");
 
-        write(&file, 42).await.unwrap();
-        write(&file, 1_700_000_000).await.unwrap();
+        write(&file, "42").await.unwrap();
+        write(&file, "1700000000").await.unwrap();
 
         assert_eq!(
             tokio::fs::read_to_string(&file).await.unwrap(),

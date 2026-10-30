@@ -43,6 +43,16 @@ impl Backoff {
     pub fn reset(&mut self) {
         self.current = self.initial;
     }
+
+    /// The delay before attempt number `attempt + 1` when only the number of
+    /// attempts so far is known (a count stored with a queued item): the
+    /// initial delay doubled `attempt` times, capped. No jitter.
+    pub fn delay_for(initial: Duration, max: Duration, attempt: u32) -> Duration {
+        initial
+            .checked_mul(1u32.checked_shl(attempt).unwrap_or(u32::MAX))
+            .unwrap_or(max)
+            .min(max)
+    }
 }
 
 /// Cheap, dependency-free pseudo-randomness; only spreads out retry timing.
@@ -66,6 +76,22 @@ mod tests {
         assert_eq!(backoff.next_delay(), Duration::from_secs(12));
         backoff.reset();
         assert_eq!(backoff.next_delay(), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn delay_for_a_stored_attempt_count() {
+        let (initial, max) = (Duration::from_secs(30), Duration::from_secs(3600));
+        assert_eq!(Backoff::delay_for(initial, max, 0), Duration::from_secs(30));
+        assert_eq!(
+            Backoff::delay_for(initial, max, 3),
+            Duration::from_secs(240)
+        );
+        assert_eq!(
+            Backoff::delay_for(initial, max, 7),
+            Duration::from_secs(3600)
+        );
+        assert_eq!(Backoff::delay_for(initial, max, 40), max);
+        assert_eq!(Backoff::delay_for(initial, max, u32::MAX), max);
     }
 
     #[test]

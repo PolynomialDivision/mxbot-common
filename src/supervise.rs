@@ -11,6 +11,8 @@
 //! once per round: when no tick came for the given time, [`crate::heartbeat`] stops refreshing
 //! the heartbeat file, the health check fails and health-bot reports the container unhealthy.
 //! A loop that sleeps until a date (a monthly summary) uses [`supervise`] without ticks.
+//! A loop that can fail a round reports it with [`Alive::ok`] / [`Alive::failed`]: failing for
+//! longer than its time counts as unhealthy too.
 //!
 //! Not for tasks that end by design (per request, one-shot, a test mode that posts once).
 
@@ -73,6 +75,12 @@ where
 }
 
 /// A ticking task's handle: [`tick`](Self::tick) once per round of its loop.
+///
+/// A loop that can tell a good round from a bad one says so with [`ok`](Self::ok) and
+/// [`failed`](Self::failed): a loop that keeps ticking but fails every round (a wrong
+/// password, a service that refuses it) counts as unhealthy once it has failed for longer
+/// than its `within`, as a hung loop does. Only [`tick`](Self::tick): hangs are noticed,
+/// failures are not.
 #[derive(Clone, Debug)]
 pub struct Alive(Arc<Slot>);
 
@@ -81,6 +89,23 @@ impl Alive {
     pub fn tick(&self) {
         *lock(&self.0.last) = Instant::now();
     }
+
+    /// A round that did its work: ticks, and ends a run of failures.
+    pub fn ok(&self) {
+        self.tick();
+        *lock(&self.0.failing) = None;
+    }
+
+    /// A round that failed: ticks (the loop is not hung), and starts or continues a run of
+    /// failures; `reason` is shown while the task counts as unhealthy.
+    pub fn failed(&self, reason: impl std::fmt::Display) {
+        self.tick();
+        let mut failing = lock(&self.0.failing);
+        let since = failing
+            .as_ref()
+            .map_or_else(Instant::now, |(since, _)| *since);
+        *failing = Some((since, reason.to_string()));
+    }
 }
 
 #[derive(Debug)]
@@ -88,6 +113,16 @@ struct Slot {
     name: String,
     within: Duration,
     last: Mutex<Instant>,
+    /// Since when every round failed, and the last reason.
+    failing: Mutex<Option<(Instant, String)>>,
+}
+
+/// A supervised task that counts as unhealthy: hung, or failing for too long.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Unhealthy {
+    pub name: String,
+    /// For the log and the health check: "12 min without a round" or "failing for 12 min: …".
+    pub why: String,
 }
 
 fn slots() -> &'static Mutex<Vec<Arc<Slot>>> {
@@ -100,6 +135,7 @@ fn register(name: String, within: Duration) -> Alive {
         name,
         within,
         last: Mutex::new(Instant::now()),
+        failing: Mutex::new(None),
     });
     lock(slots()).push(Arc::clone(&slot));
     Alive(slot)
@@ -118,6 +154,41 @@ fn stalled_at(now: Instant) -> Vec<(String, u64)> {
             (quiet > slot.within).then(|| (slot.name.clone(), quiet.as_secs()))
         })
         .collect()
+}
+
+/// The ticking tasks that count as unhealthy: no tick within their time, or failing for
+/// longer than it.
+pub fn unhealthy() -> Vec<Unhealthy> {
+    unhealthy_at(Instant::now())
+}
+
+fn unhealthy_at(now: Instant) -> Vec<Unhealthy> {
+    lock(slots())
+        .iter()
+        .filter_map(|slot| {
+            let quiet = now.saturating_duration_since(*lock(&slot.last));
+            if quiet > slot.within {
+                return Some(Unhealthy {
+                    name: slot.name.clone(),
+                    why: format!("{} without a round", minutes(quiet)),
+                });
+            }
+            let failing = lock(&slot.failing);
+            let (since, reason) = failing.as_ref()?;
+            let long = now.saturating_duration_since(*since);
+            (long > slot.within).then(|| Unhealthy {
+                name: slot.name.clone(),
+                why: format!("failing for {}: {reason}", minutes(long)),
+            })
+        })
+        .collect()
+}
+
+fn minutes(d: Duration) -> String {
+    match d.as_secs() {
+        s if s < 120 => format!("{s} s"),
+        s => format!("{} min", s / 60),
+    }
 }
 
 /// A poisoned lock still holds a usable value here (an Instant, a list of slots).
@@ -191,6 +262,38 @@ mod tests {
         assert!(!handle.is_finished());
         assert_eq!(ended("runs"), None);
         handle.abort();
+    }
+
+    #[test]
+    fn a_task_that_fails_every_round_turns_unhealthy_after_its_time() {
+        let alive = register("imap under test".into(), Duration::from_secs(600));
+        let mine = |at| {
+            unhealthy_at(at)
+                .into_iter()
+                .find(|u| u.name == "imap under test")
+        };
+        alive.failed("LOGIN refused");
+        assert_eq!(mine(Instant::now()), None, "just started failing");
+        // the run started 11 minutes ago; the loop still ticks every round
+        let started = Instant::now()
+            .checked_sub(Duration::from_secs(660))
+            .unwrap();
+        lock(&alive.0.failing).as_mut().unwrap().0 = started;
+        alive.failed("LOGIN refused again"); // keeps the run's start
+        let late = mine(Instant::now()).expect("failing too long");
+        assert_eq!(late.why, "failing for 11 min: LOGIN refused again");
+        alive.ok();
+        assert_eq!(mine(Instant::now()), None);
+    }
+
+    #[test]
+    fn a_hung_task_is_unhealthy_with_its_quiet_time() {
+        let _alive = register("hung under test".into(), Duration::from_secs(60));
+        let u = unhealthy_at(Instant::now() + Duration::from_secs(185))
+            .into_iter()
+            .find(|u| u.name == "hung under test")
+            .expect("hung");
+        assert_eq!(u.why, "3 min without a round");
     }
 
     #[test]

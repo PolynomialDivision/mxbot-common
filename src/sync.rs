@@ -2,11 +2,12 @@
 
 use std::{
     sync::OnceLock,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use matrix_sdk::{
-    config::SyncSettings, ruma::api::client::filter::FilterDefinition, Client, LoopCtrl,
+    config::SyncSettings, ruma::api::client::filter::FilterDefinition, store::StateStoreDataKey,
+    Client, LoopCtrl,
 };
 use tokio::{sync::watch, time::sleep};
 use tracing::{info, warn};
@@ -62,7 +63,22 @@ pub fn sync_settings() -> SyncSettings {
 /// Never gives up: background tasks (schedulers, pollers) keep running
 /// while the homeserver is unreachable, and the bot catches up once it is
 /// back.
+///
+/// From an empty store (no sync position yet) the first sync brings each
+/// room's recent history along: [`crate::events::is_replayed`] marks those
+/// events, so old commands are not run again.
 pub async fn initial_sync(client: &Client) {
+    let empty_store = matches!(
+        client
+            .state_store()
+            .get_kv_data(StateStoreDataKey::SyncToken)
+            .await,
+        Ok(None)
+    );
+    if empty_store {
+        crate::events::starting_from_empty_store(SystemTime::now());
+        info!("Starting from an empty store: messages sent before now are history, not commands");
+    }
     let mut backoff = Backoff::new(RETRY_INITIAL, RETRY_MAX);
     let mut attempt = 1u32;
     loop {

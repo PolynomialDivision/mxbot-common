@@ -261,6 +261,12 @@ impl AdminConsole {
             return Dispatch::Continue;
         }
         let sender = event.sender.as_ref();
+        // History from the first sync of an empty store: not a command (also for the bot's own
+        // commands behind the console).
+        if crate::events::is_replayed(event.origin_server_ts) {
+            info!(user_id = %sender, room_id = %room.room_id(), "Ignoring a command sent before this store existed");
+            return Dispatch::Handled;
+        }
         let command = parse(body);
 
         match self.access(room, sender, encryption).await {
@@ -298,16 +304,9 @@ impl AdminConsole {
             }
             Access::None => match command {
                 None => Dispatch::Continue,
-                Some(command @ (Command::ResetTrust(_) | Command::VerifyDevice(..))) => {
-                    // Shared rooms: legacy, silent handling.
-                    if self.is_admin(sender) {
-                        let outcome = self.run(sender, command).await;
-                        info!(admin_user_id = %sender, room_id = %room.room_id(), outcome, "Handled verification command");
-                    } else {
-                        warn!(user_id = %sender, "Ignoring verification command from non-administrator");
-                    }
-                    Dispatch::Handled
-                }
+                // `!reset-trust` and `!verify-device` change whose devices the bot trusts:
+                // only in the console (an encrypted direct chat), as every admin command.
+                // They used to run silently in any room, on the sender's ID alone.
                 Some(_) => {
                     if self.is_admin(sender) {
                         self.reply(

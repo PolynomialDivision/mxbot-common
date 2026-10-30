@@ -372,11 +372,52 @@ pub fn store_path_from_env() -> PathBuf {
         .into()
 }
 
+/// Environment variable: set (to anything but `0` or empty), [`load_toml`] refuses a config
+/// with keys the bot does not know, instead of warning about them.
+pub const STRICT_CONFIG_ENV: &str = "MXBOT_STRICT_CONFIG";
+
 /// Read and parse a TOML config file.
+///
+/// Keys the bot does not know (a typo such as `require_verfied_device`, which would silently
+/// keep the default) are logged as warnings, or refused with [`STRICT_CONFIG_ENV`] set.
+/// Sections that deny unknown fields still refuse them as before; a section with a
+/// `#[serde(flatten)]` field cannot tell its unknown keys apart and says nothing about them.
 pub fn load_toml<T: DeserializeOwned>(path: &Path) -> Result<T> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("Reading config {}", path.display()))?;
-    toml::from_str(&raw).with_context(|| format!("Parsing config {}", path.display()))
+    let (value, unknown) =
+        parse_toml(&raw).with_context(|| format!("Parsing config {}", path.display()))?;
+    if unknown.is_empty() {
+        return Ok(value);
+    }
+    let strict = std::env::var(STRICT_CONFIG_ENV).is_ok_and(|v| !v.is_empty() && v != "0");
+    if strict {
+        anyhow::bail!(
+            "Config {} has unknown keys: {} ({STRICT_CONFIG_ENV} is set)",
+            path.display(),
+            unknown.join(", ")
+        );
+    }
+    for key in &unknown {
+        // Some bots read their config before logging starts: then on stderr.
+        if tracing::dispatcher::has_been_set() {
+            warn!(config = %path.display(), key, "Unknown config key (a typo?); ignored");
+        } else {
+            eprintln!(
+                "Unknown config key in {} (a typo?), ignored: {key}",
+                path.display()
+            );
+        }
+    }
+    Ok(value)
+}
+
+/// Parse TOML into `T`, with the dotted paths of the keys `T` ignored.
+fn parse_toml<T: DeserializeOwned>(raw: &str) -> Result<(T, Vec<String>)> {
+    let mut unknown = Vec::new();
+    let deserializer = toml::Deserializer::parse(raw)?;
+    let value = serde_ignored::deserialize(deserializer, |key| unknown.push(key.to_string()))?;
+    Ok((value, unknown))
 }
 
 /// Parse a list of user IDs, warning about (and skipping) invalid entries.
@@ -455,6 +496,55 @@ pub fn parse_hh_mm(value: &str) -> Result<(u32, u32)> {
 
 #[cfg(test)]
 mod tests {
+    /// A section with `#[serde(flatten)]` hands its leftovers to the flattened part, so its
+    /// unknown keys go unnoticed: no false alarm, but no warning either.
+    #[test]
+    fn flattened_sections_report_no_known_key() {
+        #[derive(serde::Deserialize, Debug)]
+        struct Inner {
+            allowed: Vec<String>,
+        }
+        #[derive(serde::Deserialize, Debug)]
+        struct Outer {
+            #[serde(flatten)]
+            inner: Inner,
+            own: bool,
+        }
+        #[derive(serde::Deserialize, Debug)]
+        struct Conf {
+            security: Outer,
+        }
+        let (conf, unknown) =
+            super::parse_toml::<Conf>("[security]\nallowed = [\"a\"]\nown = true\ntypo = 1\n")
+                .unwrap();
+        assert!(conf.security.own && conf.security.inner.allowed == ["a"]);
+        assert!(unknown.is_empty(), "{unknown:?}");
+    }
+
+    #[test]
+    fn unknown_keys_are_named_known_ones_parse() {
+        #[derive(serde::Deserialize, Debug)]
+        struct Sec {
+            #[serde(default)]
+            require_verified_device: bool,
+        }
+        #[derive(serde::Deserialize, Debug)]
+        struct Conf {
+            name: String,
+            security: Sec,
+        }
+        let (conf, unknown) = super::parse_toml::<Conf>(
+            "name = \"x\"\nextra = 1\n[security]\nrequire_verfied_device = true\n",
+        )
+        .unwrap();
+        assert_eq!(conf.name, "x");
+        assert!(
+            !conf.security.require_verified_device,
+            "the typo keeps the default"
+        );
+        assert_eq!(unknown, vec!["extra", "security.require_verfied_device"]);
+    }
+
     #[test]
     fn omitted_allow_lists_are_unset_and_refused() {
         let unset: SecurityConfig = toml::from_str("").unwrap();

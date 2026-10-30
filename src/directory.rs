@@ -348,7 +348,10 @@ mod tests {
             ["anna", "Ben", "cara"]
         );
         // the shown name, trimmed; none in the directory: empty
-        assert_eq!((p[0].name.as_str(), p[1].name.as_str()), ("Anna Schmidt", ""));
+        assert_eq!(
+            (p[0].name.as_str(), p[1].name.as_str()),
+            ("Anna Schmidt", "")
+        );
         // the house account first, no duplicates, invalid IDs left out
         assert_eq!(p[0].accounts, ids(&["@anna:house.org", "@anna:matrix.org"]));
         assert_eq!(
