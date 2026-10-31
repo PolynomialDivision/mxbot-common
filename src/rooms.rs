@@ -844,8 +844,6 @@ mod tests {
                 .iter()
                 .map(|l| Link {
                     id: OwnedUserId::try_from(*l).unwrap(),
-                    by_admin: false,
-                    verified: true,
                 })
                 .collect();
             Person {
@@ -860,6 +858,7 @@ mod tests {
                 house: Some(house),
                 links,
                 choice: Choice::None,
+                stay_until: None,
             }
         };
         let people = People::new(vec![
@@ -919,7 +918,7 @@ mod tests {
             username: "x".into(),
             account: OwnedUserId::try_from(account).unwrap(),
             at: chrono::DateTime::from_timestamp(1_800_000_000 - ago, 0).unwrap(),
-            verified: Vec::new(),
+            linked: Vec::new(),
         };
         let requests = [
             request("@anna:matrix.org", 60),

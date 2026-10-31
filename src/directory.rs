@@ -5,15 +5,15 @@
 //! Their accounts:
 //! * the house account, @<login>:<server> (or the localpart attribute): tuwunel makes it at
 //!   the first login, so it is always theirs, but it may not exist yet;
-//! * links an admin entered (the `matrix_ids` attribute): recognised as the person, never an
-//!   address the bots pick by themselves;
-//! * links the person proved (`matrix_verified`, written by the provider's flow
-//!   `house-matrix-accounts` after a link code, [`crate::link`]).
+//! * their links (the `matrix_ids` attribute): entered by an admin, or proved by the person
+//!   with a link code (the provider's flow `house-matrix-accounts` appends it, [`crate::link`]).
+//!   Both count the same: recognised as the person, choosable, and never an address the bots
+//!   pick by themselves (an admin's typo reaches nobody until the person chooses that account).
 //!
 //! A link on the house's own server is refused (a house account is bound by the login, a link
 //! cannot claim one), and so is an account two active people claim: it counts for nobody
 //! ([`People::conflicts`]). Where the bots invite and write to someone is their chosen account
-//! (`matrix_preferred`, [`People::contact`]): the house account or a proven link. Nobody has
+//! (`matrix_preferred`, [`People::contact`]): the house account or one of their links. Nobody has
 //! one until they choose; the house account is never chosen for them. Rights (admins) never
 //! follow a link: bots take them from the house account and their static lists only.
 //!
@@ -34,6 +34,18 @@
 //! for nothing); it is no part of a [`Snapshot`] and nothing about rooms or rights follows
 //! from it.
 //!
+//! Groups: the directory only says who is in which group; what a group means is the bots'
+//! config. The house's model (house-infra docs/HOUSE-DIRECTORY.md): `residents` are the full
+//! members (the house plenum, finance, shared passwords); `subtenants` live here for a while
+//! and get their own kitchen (its group: its room, plenum and cleaning plan) and nothing of the
+//! house plenum. A bot that asks "does this person live here" takes both (cleaning-bot's
+//! `residents_group` list, plenum-bot's `[members] subtenant_groups` for the kitchens); one that
+//! asks "is this a full member" takes `residents` alone.
+//!
+//! The end of a stay ([`Person::stay_until`], the `stay_until` attribute, "YYYY-MM-DD"): a date
+//! an admin may set on anyone, read as it is and never acted on here. plenum-bot reminds the
+//! admins before it and on the day; nobody is locked or removed because of it.
+//!
 //! Errors: [`is_outage`] tells a provider that is down (unreachable, timing out, 5xx, 429)
 //! from one that refuses the bot or answers what it cannot read; only the first is another
 //! service's outage (`Alive::unavailable`), the rest a broken config or bot.
@@ -43,10 +55,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{bail, Context, Result};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use matrix_sdk::ruma::{OwnedUserId, UserId};
 use serde::Deserialize;
-use tracing::warn;
+use tracing::{debug, warn};
 
 /// The `[directory]` table.
 #[derive(Deserialize, Clone, Debug)]
@@ -61,12 +73,14 @@ pub struct DirectoryConfig {
     /// User attribute that overrides the login as the house account's localpart.
     #[serde(default)]
     pub localpart_attribute: Option<String>,
-    /// User attribute with the accounts an admin linked.
+    /// User attribute with the person's linked accounts (entered by an admin or proved with a
+    /// link code; they count the same).
     #[serde(default = "default_matrix_ids_attribute")]
     pub matrix_ids_attribute: String,
-    /// User attribute with the accounts the person proved.
-    #[serde(default = "default_verified_attribute")]
-    pub verified_attribute: String,
+    /// Deprecated and ignored: proved links are in `matrix_ids_attribute` too. Accepted so an
+    /// older config still loads.
+    #[serde(default, rename = "verified_attribute")]
+    pub _verified_attribute: Option<String>,
     /// User attribute with the person's chosen account.
     #[serde(default = "default_preferred_attribute")]
     pub preferred_attribute: String,
@@ -74,6 +88,9 @@ pub struct DirectoryConfig {
     /// seconds>}`), written by the provider's flow, removed when the link succeeds.
     #[serde(default = "default_link_request_attribute")]
     pub link_request_attribute: String,
+    /// User attribute with the end of the person's stay ("YYYY-MM-DD"; [`Person::stay_until`]).
+    #[serde(default = "default_stay_until_attribute")]
+    pub stay_until_attribute: String,
     /// Environment variable with the read-only API token.
     #[serde(default = "default_token_env")]
     pub token_env: String,
@@ -96,16 +113,16 @@ fn default_matrix_ids_attribute() -> String {
     "matrix_ids".to_owned()
 }
 
-fn default_verified_attribute() -> String {
-    "matrix_verified".to_owned()
-}
-
 fn default_preferred_attribute() -> String {
     "matrix_preferred".to_owned()
 }
 
 fn default_link_request_attribute() -> String {
     "matrix_link_request".to_owned()
+}
+
+fn default_stay_until_attribute() -> String {
+    "stay_until".to_owned()
 }
 
 fn default_token_env() -> String {
@@ -143,7 +160,7 @@ pub struct Person {
     /// Deactivated people are in [`People::all`] only (a bot can tell "deactivated" from
     /// "gone"); they are in no group and own no account.
     pub active: bool,
-    /// The house account first, then the links in their order (admin-entered, then proved).
+    /// The house account first, then the links in their order.
     pub accounts: Vec<OwnedUserId>,
     pub groups: BTreeSet<String>,
     /// The house account, when the login makes a valid one.
@@ -151,16 +168,17 @@ pub struct Person {
     pub links: Vec<Link>,
     /// What the person chose, unchecked ([`People::contact`] checks it).
     pub choice: Choice,
+    /// The last day of their stay (`stay_until_attribute`), when an admin set one: read as it
+    /// is, of deactivated people too (a bot acting on it skips them). Unset, empty or not a
+    /// date: None (logged at debug level; a read never fails for it).
+    pub stay_until: Option<NaiveDate>,
 }
 
-/// An account linked to a person.
+/// An account linked to a person (`matrix_ids`: entered by an admin or proved with a link
+/// code, the same either way).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Link {
     pub id: OwnedUserId,
-    /// An admin entered it (`matrix_ids`).
-    pub by_admin: bool,
-    /// The person proved it is theirs (`matrix_verified`).
-    pub verified: bool,
 }
 
 /// The chosen-account attribute as it is.
@@ -175,7 +193,7 @@ pub enum Choice {
 /// Where the bots invite and write to a person.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Contact {
-    /// Their chosen account: the house account or a proven link.
+    /// Their chosen account: the house account or one of their links.
     Chosen(OwnedUserId),
     /// They have not chosen: nobody new is invited, they are asked to choose.
     Unchosen,
@@ -187,7 +205,7 @@ pub enum Contact {
 pub enum Invalid {
     /// The attribute is not a Matrix ID.
     Malformed,
-    /// Neither their house account nor a link they proved.
+    /// Neither their house account nor one of their links.
     NotTheirs,
     /// Another active person claims it too.
     Conflict,
@@ -285,8 +303,8 @@ impl People {
             Choice::Malformed => return Contact::Invalid(Invalid::Malformed),
             Choice::Account(id) => id,
         };
-        let theirs = person.house.as_ref() == Some(id)
-            || person.links.iter().any(|l| &l.id == id && l.verified);
+        // an admin's link counts as the person's own: invitations go only where they chose
+        let theirs = person.house.as_ref() == Some(id) || person.links.iter().any(|l| &l.id == id);
         if !theirs {
             Contact::Invalid(Invalid::NotTheirs)
         } else if self.is_conflict(id) {
@@ -351,8 +369,8 @@ pub struct LinkRequest {
     pub account: OwnedUserId,
     /// When the person asked (the provider's clock).
     pub at: DateTime<Utc>,
-    /// The accounts the person proved already (`verified_attribute`, on other servers).
-    pub verified: Vec<OwnedUserId>,
+    /// The accounts linked to the person already (`matrix_ids`, on other servers).
+    pub linked: Vec<OwnedUserId>,
 }
 
 impl LinkRequest {
@@ -417,9 +435,8 @@ fn link_requests_of(
         .filter_map(|u| {
             let (account, at) = link_request_value(u.attributes.get(&cfg.link_request_attribute)?)?;
             let house = house_account(u, cfg, server_name);
-            let verified = links_of(u, cfg, server_name, house.as_deref())
+            let linked = links_of(u, cfg, server_name, house.as_deref())
                 .into_iter()
-                .filter(|l| l.verified)
                 .map(|l| l.id)
                 .collect();
             Some(LinkRequest {
@@ -427,7 +444,7 @@ fn link_requests_of(
                 username: u.username.clone(),
                 account,
                 at,
-                verified,
+                linked,
             })
         })
         .collect()
@@ -799,6 +816,7 @@ fn people_of(users: &[User], cfg: &DirectoryConfig, server_name: &str) -> Result
             house,
             links,
             choice: choice_of(u, cfg),
+            stay_until: stay_until_of(u, cfg),
         });
     }
     Ok(out)
@@ -844,36 +862,51 @@ fn links_of(
     house: Option<&UserId>,
 ) -> Vec<Link> {
     let mut out: Vec<Link> = Vec::new();
-    let sources = [
-        (cfg.matrix_ids_attribute.as_str(), true),
-        (cfg.verified_attribute.as_str(), false),
-    ];
-    for (attribute, by_admin) in sources {
-        for item in listed(user, attribute) {
-            let Ok(id) = UserId::parse(item) else {
-                warn!(user = %user.username, %attribute, "Directory: not a Matrix ID, left out");
-                continue;
-            };
-            if Some(id.as_ref()) == house {
-                continue;
-            }
-            if id.server_name().as_str() == server_name {
-                warn!(user = %user.username, %attribute, account = %id,
-                    "Directory: a link on the house's server, left out (house accounts come from the login)");
-                continue;
-            }
-            match out.iter_mut().find(|l| l.id == id) {
-                Some(link) if by_admin => link.by_admin = true,
-                Some(link) => link.verified = true,
-                None => out.push(Link {
-                    id,
-                    by_admin,
-                    verified: !by_admin,
-                }),
-            }
+    let attribute = cfg.matrix_ids_attribute.as_str();
+    for item in listed(user, attribute) {
+        let Ok(id) = UserId::parse(item) else {
+            warn!(user = %user.username, %attribute, "Directory: not a Matrix ID, left out");
+            continue;
+        };
+        if Some(id.as_ref()) == house {
+            continue;
+        }
+        if id.server_name().as_str() == server_name {
+            warn!(user = %user.username, %attribute, account = %id,
+                "Directory: a link on the house's server, left out (house accounts come from the login)");
+            continue;
+        }
+        if !out.iter().any(|l| l.id == id) {
+            out.push(Link { id });
         }
     }
     out
+}
+
+/// The stay's end: "YYYY-MM-DD", or the date of a timestamp starting with one ("2026-11-30T00:00:00Z":
+/// how a YAML editor that reads dates may store it). Anything else is no date: None, logged at
+/// debug level only (an admin's typo must not fail the read or flood the log every round).
+fn stay_until_of(user: &User, cfg: &DirectoryConfig) -> Option<NaiveDate> {
+    let attribute = cfg.stay_until_attribute.as_str();
+    let text = match user.attributes.get(attribute)? {
+        serde_json::Value::Null => return None,
+        serde_json::Value::String(s) => s.trim(),
+        _ => {
+            debug!(user = %user.username, %attribute, "Directory: not a date (YYYY-MM-DD), ignored");
+            return None;
+        }
+    };
+    if text.is_empty() {
+        return None;
+    }
+    let day = text.split_once('T').map_or(text, |(day, _)| day);
+    match NaiveDate::parse_from_str(day, "%Y-%m-%d") {
+        Ok(date) => Some(date),
+        Err(_) => {
+            debug!(user = %user.username, %attribute, "Directory: not a date (YYYY-MM-DD), ignored");
+            None
+        }
+    }
 }
 
 fn choice_of(user: &User, cfg: &DirectoryConfig) -> Choice {
@@ -928,12 +961,23 @@ mod tests {
         assert_eq!(c.token_env, "DIRECTORY_TOKEN");
         assert_eq!(c.matrix_ids_attribute, "matrix_ids");
         assert_eq!(c.refresh(), Duration::from_secs(900));
-        assert_eq!(c.verified_attribute, "matrix_verified");
         assert_eq!(c.preferred_attribute, "matrix_preferred");
         // a config from before link requests: the default attribute
         assert_eq!(c.link_request_attribute, "matrix_link_request");
+        // a config from before the stay's end: the default attribute
+        assert_eq!(c.stay_until_attribute, "stay_until");
         assert_eq!(c.stale_after(), Duration::from_secs(3600));
         assert!(c.server_name.is_none());
+    }
+
+    #[test]
+    fn an_older_config_with_the_dropped_verified_attribute_still_loads() {
+        let c: DirectoryConfig = toml::from_str(
+            "provider = 'authentik'\napi_url = 'https://login.example.org/api/v3'\n\
+             verified_attribute = 'whatever'",
+        )
+        .unwrap();
+        assert_eq!(c.matrix_ids_attribute, "matrix_ids");
     }
 
     #[test]
@@ -1141,11 +1185,53 @@ mod tests {
     }
 
     #[test]
-    fn links_admin_entered_and_proved_and_never_on_the_house_server() {
+    fn the_stay_s_end_is_a_date_or_nothing_and_never_fails_a_read() {
+        let p = index(serde_json::json!([
+            {"uuid": "a", "username": "a", "groups_obj": [{"name": "subtenants"}],
+             "attributes": {"stay_until": "2026-11-30"}},
+            // spaces, and a timestamp a YAML editor may have made of the date
+            {"uuid": "b", "username": "b", "groups_obj": [], "attributes": {"stay_until": " 2027-01-15 "}},
+            {"uuid": "c", "username": "c", "groups_obj": [], "attributes": {"stay_until": "2026-12-01T00:00:00.000Z"}},
+            // none, empty, null: no end
+            {"uuid": "d", "username": "d", "groups_obj": [], "attributes": {}},
+            {"uuid": "e", "username": "e", "groups_obj": [], "attributes": {"stay_until": ""}},
+            {"uuid": "f", "username": "f", "groups_obj": [], "attributes": {"stay_until": null}},
+            // malformed: ignored, the read goes on
+            {"uuid": "g", "username": "g", "groups_obj": [], "attributes": {"stay_until": "30.11.2026"}},
+            {"uuid": "h", "username": "h", "groups_obj": [], "attributes": {"stay_until": "2026-02-30"}},
+            {"uuid": "i", "username": "i", "groups_obj": [], "attributes": {"stay_until": 20261130}},
+            {"uuid": "j", "username": "j", "groups_obj": [], "attributes": {"stay_until": ["2026-11-30"]}},
+            // deactivated: read as it is (a bot acting on it skips them)
+            {"uuid": "k", "username": "k", "is_active": false, "groups_obj": [],
+             "attributes": {"stay_until": "2026-11-30"}}
+        ]));
+        let until = |uuid: &str| p.by_id(uuid).unwrap().stay_until;
+        let day = |y, m, d| NaiveDate::from_ymd_opt(y, m, d);
+        assert_eq!(until("a"), day(2026, 11, 30));
+        assert_eq!(until("b"), day(2027, 1, 15));
+        assert_eq!(until("c"), day(2026, 12, 1));
+        for none in ["d", "e", "f", "g", "h", "i", "j"] {
+            assert_eq!(until(none), None, "{none}");
+        }
+        assert_eq!(until("k"), day(2026, 11, 30));
+        assert!(!p.by_id("k").unwrap().active);
+        // another attribute name
+        let mut c = cfg();
+        c.stay_until_attribute = "moving_out".into();
+        let users: Vec<User> = serde_json::from_value(serde_json::json!([
+            {"uuid": "a", "username": "a", "groups_obj": [],
+             "attributes": {"stay_until": "2026-11-30", "moving_out": "2026-10-31"}}
+        ]))
+        .unwrap();
+        let people = people_of(&users, &c, "house.org").unwrap();
+        assert_eq!(people[0].stay_until, day(2026, 10, 31));
+    }
+
+    #[test]
+    fn links_deduplicated_and_never_on_the_house_server() {
         let p = index(serde_json::json!([
             {"uuid": "1", "username": "anna", "groups_obj": [],
-             "attributes": {"matrix_ids": ["@anna:matrix.org", "@bob:house.org", "@anna:house.org"],
-                            "matrix_verified": "@anna:matrix.org @anna:example.org"}}
+             "attributes": {"matrix_ids": "@anna:matrix.org, @bob:house.org @anna:house.org @anna:matrix.org @anna:example.org"}}
         ]));
         let anna = &p.all()[0];
         assert_eq!(anna.house, Some(id("@anna:house.org")));
@@ -1153,14 +1239,10 @@ mod tests {
             anna.links,
             [
                 Link {
-                    id: id("@anna:matrix.org"),
-                    by_admin: true,
-                    verified: true
+                    id: id("@anna:matrix.org")
                 },
                 Link {
-                    id: id("@anna:example.org"),
-                    by_admin: false,
-                    verified: true
+                    id: id("@anna:example.org")
                 },
             ]
         );
@@ -1174,13 +1256,13 @@ mod tests {
         let p = index(serde_json::json!([
             // Person A: only the house account, nothing chosen
             {"uuid": "a", "username": "a", "groups_obj": [], "attributes": {}},
-            // Person B: chose a proved link
+            // Person B: chose a link (proved with a code)
             {"uuid": "b", "username": "b", "groups_obj": [],
-             "attributes": {"matrix_verified": ["@b:matrix.org"], "matrix_preferred": "@b:matrix.org"}},
+             "attributes": {"matrix_ids": ["@b:matrix.org"], "matrix_preferred": "@b:matrix.org"}},
             // chose the house account
             {"uuid": "c", "username": "c", "groups_obj": [],
              "attributes": {"matrix_preferred": " @c:house.org "}},
-            // chose a link only an admin entered: not proved
+            // chose a link an admin entered: the same
             {"uuid": "d", "username": "d", "groups_obj": [],
              "attributes": {"matrix_ids": ["@d:matrix.org"], "matrix_preferred": "@d:matrix.org"}},
             // chose someone else's account
@@ -1196,7 +1278,7 @@ mod tests {
         assert_eq!(contact("a"), Contact::Unchosen);
         assert_eq!(contact("b"), Contact::Chosen(id("@b:matrix.org")));
         assert_eq!(contact("c"), Contact::Chosen(id("@c:house.org")));
-        assert_eq!(contact("d"), Contact::Invalid(Invalid::NotTheirs));
+        assert_eq!(contact("d"), Contact::Chosen(id("@d:matrix.org")));
         assert_eq!(contact("e"), Contact::Invalid(Invalid::NotTheirs));
         assert_eq!(contact("f"), Contact::Invalid(Invalid::Malformed));
         assert_eq!(contact("g"), Contact::Invalid(Invalid::Malformed));
@@ -1209,7 +1291,7 @@ mod tests {
     fn an_account_two_active_people_claim_counts_for_nobody() {
         let p = index(serde_json::json!([
             {"uuid": "1", "username": "anna", "groups_obj": [{"name": "kitchen-floor-1"}],
-             "attributes": {"matrix_verified": ["@shared:matrix.org"], "matrix_preferred": "@shared:matrix.org"}},
+             "attributes": {"matrix_ids": ["@shared:matrix.org"], "matrix_preferred": "@shared:matrix.org"}},
             {"uuid": "2", "username": "ben", "groups_obj": [{"name": "kitchen-floor-1"}],
              "attributes": {"matrix_ids": ["@shared:matrix.org"]}},
             // renamed: keeps the old localpart, which the new "cara" would get too
@@ -1444,12 +1526,11 @@ mod tests {
     }
 
     #[test]
-    fn link_requests_of_active_people_with_their_proved_accounts() {
+    fn link_requests_of_active_people_with_their_linked_accounts() {
         let r = requests(serde_json::json!([
             {"uuid": "u-anna", "username": "anna", "name": " Anna Schmidt ",
              "groups_obj": [{"name": "residents"}],
-             "attributes": {"matrix_verified": ["@anna:example.org", "@anna:house.org"],
-                            "matrix_ids": ["@anna:admin.org"],
+             "attributes": {"matrix_ids": ["@anna:example.org", "@anna:house.org", "@anna:admin.org"],
                             "matrix_link_request": {"id": "@anna:matrix.org", "at": 1_800_000_000}}},
             {"uuid": "u-ben", "username": "ben", "groups_obj": [{"name": "residents"}],
              "attributes": {}},
@@ -1471,8 +1552,10 @@ mod tests {
             ("u-anna", "anna")
         );
         assert_eq!(anna.account, id("@anna:matrix.org"));
-        // proved links only (not the admin's, never on the house's server)
-        assert_eq!(anna.verified, ids(&["@anna:example.org"]));
+        // every link (never one on the house's server)
+        let mut linked = anna.linked.clone();
+        linked.sort();
+        assert_eq!(linked, ids(&["@anna:admin.org", "@anna:example.org"]));
         assert_eq!(anna.key(), "u-anna @anna:matrix.org 1800000000");
         // another attribute name
         let mut c = cfg();
@@ -1526,7 +1609,7 @@ mod tests {
             username: "anna".into(),
             account: id("@anna:matrix.org"),
             at: DateTime::from_timestamp(at, 0).unwrap(),
-            verified: Vec::new(),
+            linked: Vec::new(),
         };
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
         let r = request(1_800_000_000);
@@ -1699,7 +1782,7 @@ mod tests {
     fn claimants_name_every_active_person_claiming_an_account() {
         let p = index(serde_json::json!([
             {"uuid": "1", "username": "anna", "groups_obj": [],
-             "attributes": {"matrix_verified": ["@shared:matrix.org"]}},
+             "attributes": {"matrix_ids": ["@shared:matrix.org"]}},
             {"uuid": "2", "username": "ben", "groups_obj": [],
              "attributes": {"matrix_ids": ["@shared:matrix.org", "@ben:matrix.org"]}},
             {"uuid": "3", "username": "gone", "is_active": false, "groups_obj": [],

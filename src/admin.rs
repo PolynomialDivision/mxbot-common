@@ -847,8 +847,6 @@ mod tests {
                 .iter()
                 .map(|l| Link {
                     id: OwnedUserId::try_from(*l).unwrap(),
-                    by_admin: true,
-                    verified: true,
                 })
                 .collect();
             Person {
@@ -863,6 +861,7 @@ mod tests {
                 house: Some(house),
                 links,
                 choice: Choice::None,
+                stay_until: None,
             }
         };
         let people = People::new(vec![

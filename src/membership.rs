@@ -4,8 +4,9 @@
 //! docs/HOUSE-DIRECTORY.md, "The room reconciler").
 //!
 //! From one [`Snapshot`], for each managed room ([`plan`]):
-//! * **wanted**: the active people in one of the room's groups who are in its required group
-//!   too ([`Rule`]);
+//! * **wanted**: the active people in one of the room's groups who are in one of its required
+//!   groups too ([`Rule`]: a kitchen's room requires that its people live here, `residents` or
+//!   `subtenants`);
 //! * **invite**: the chosen account ([`Contact::Chosen`]) of each wanted person, unless it is in
 //!   the room (joined or invited), the bot invited it before (who leaves on their own is not
 //!   invited again while the account stays theirs), or its invitation failed less than a day
@@ -127,12 +128,23 @@ impl Default for Grace {
     }
 }
 
-/// Who a room is for: the members of `group` who are in `require` too (when set). A room with
-/// several rules is for everyone one of them names.
+/// Who a room is for: the members of `group` who are in at least one of `require` too (empty:
+/// no such rule). A room with several rules is for everyone one of them names.
+///
+/// `require` is a list so a kitchen's room can take everyone who lives here, full members and
+/// subtenants alike (`["residents", "subtenants"]`), while a room of full members only requires
+/// `["residents"]`. Every group named must be known to the directory ([`Skip::UnknownGroup`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Rule {
     pub group: String,
-    pub require: Option<String>,
+    pub require: Vec<String>,
+}
+
+impl Rule {
+    /// Whether `person` (active, in `group`) meets the rule's requirement.
+    fn admits(&self, person: &Person) -> bool {
+        self.require.is_empty() || self.require.iter().any(|r| person.groups.contains(r))
+    }
 }
 
 /// What the bot remembers per room.
@@ -407,11 +419,7 @@ fn known(snapshot: &Snapshot, group: &str) -> bool {
 pub fn wanted<'a>(people: &'a People, rules: &'a [Rule]) -> BTreeMap<&'a str, &'a Person> {
     rules
         .iter()
-        .flat_map(|rule| {
-            people
-                .members(&rule.group)
-                .filter(move |p| rule.require.as_deref().is_none_or(|r| p.groups.contains(r)))
-        })
+        .flat_map(|rule| people.members(&rule.group).filter(move |p| rule.admits(p)))
         .map(|p| (p.id.as_str(), p))
         .collect()
 }
@@ -431,7 +439,7 @@ pub fn plan(
 ) -> Result<Plan, Skip> {
     if let Some(missing) = rules
         .iter()
-        .flat_map(|r| std::iter::once(&r.group).chain(r.require.as_ref()))
+        .flat_map(|r| std::iter::once(&r.group).chain(&r.require))
         .find(|g| !known(snapshot, g))
     {
         return Err(Skip::UnknownGroup(missing.clone()));
@@ -794,17 +802,10 @@ mod tests {
         UserId::parse(s).unwrap()
     }
 
-    /// A person with a house account `@<name>:h`, `groups`, verified `links` and a choice.
+    /// A person with a house account `@<name>:h`, `groups`, `links` and a choice.
     fn person(name: &str, groups: &[&str], links: &[&str], choice: Option<&str>) -> Person {
         let house = id(&format!("@{name}:h"));
-        let links: Vec<Link> = links
-            .iter()
-            .map(|l| Link {
-                id: id(l),
-                by_admin: false,
-                verified: true,
-            })
-            .collect();
+        let links: Vec<Link> = links.iter().map(|l| Link { id: id(l) }).collect();
         Person {
             id: format!("u-{name}"),
             username: name.into(),
@@ -817,6 +818,7 @@ mod tests {
             house: Some(house),
             links,
             choice: choice.map_or(Choice::None, |c| Choice::Account(id(c))),
+            stay_until: None,
         }
     }
 
@@ -849,9 +851,14 @@ mod tests {
     }
 
     fn rule(group: &str, require: Option<&str>) -> Rule {
+        rule_any(group, require.as_slice())
+    }
+
+    /// A rule whose members must be in one of `require`.
+    fn rule_any(group: &str, require: &[&str]) -> Rule {
         Rule {
             group: group.into(),
-            require: require.map(str::to_owned),
+            require: require.iter().map(|r| (*r).to_owned()).collect(),
         }
     }
 
@@ -999,6 +1006,69 @@ mod tests {
             &Remembered::default(),
         );
         assert!(p.remove.is_empty());
+    }
+
+    #[test]
+    fn a_kitchen_takes_its_subtenants_and_the_house_room_does_not() {
+        // g lives here for a while: kitchen 3, never the house's room
+        let g = chosen("g", &["subtenants", "kitchen-floor-3"]);
+        let s = Snapshot {
+            groups: GROUPS
+                .iter()
+                .chain(&["subtenants"])
+                .map(|g| (*g).to_owned())
+                .collect(),
+            ..snap(vec![g, chosen("h", &["residents", "kitchen-floor-3"])])
+        };
+        let kitchen = [rule_any("kitchen-floor-3", &["residents", "subtenants"])];
+        let p = plan_of(&s, &kitchen, &[], &Remembered::default());
+        assert_eq!(p.invite, ids(&["@g:h", "@h:h"]));
+        // in the room already: kept
+        let p = plan_of(
+            &s,
+            &kitchen,
+            &room(&["@g:h", "@h:h"]),
+            &Remembered::default(),
+        );
+        assert!(p.remove.is_empty());
+        // the house's room (residents, no requirement) and a room of full members only
+        for rules in [
+            vec![rule("residents", None)],
+            vec![rule("kitchen-floor-3", Some("residents"))],
+        ] {
+            let p = plan_of(&s, &rules, &room(&["@g:h", "@h:h"]), &Remembered::default());
+            assert_eq!(removed(&p), ["@g:h"], "{rules:?}");
+            let p = plan_of(&s, &rules, &[], &Remembered::default());
+            assert_eq!(p.invite, ids(&["@h:h"]), "{rules:?}");
+        }
+        // g moves out (subtenants → former-residents): the kitchen lets them go
+        let s = Snapshot {
+            groups: s.groups.clone(),
+            ..snap(vec![
+                chosen("g", &["former-residents", "kitchen-floor-3"]),
+                chosen("h", &["residents", "kitchen-floor-3"]),
+            ])
+        };
+        let p = plan_of(
+            &s,
+            &kitchen,
+            &room(&["@g:h", "@h:h"]),
+            &Remembered::default(),
+        );
+        assert_eq!(removed(&p), ["@g:h"]);
+        // a required group the directory does not know leaves the room alone
+        let unknown = [rule_any("kitchen-floor-3", &["residents", "lodgers"])];
+        let skip = plan(
+            &s,
+            &unknown,
+            &room(&["@g:h", "@h:h"]),
+            &HashSet::new(),
+            &me(),
+            &Remembered::default(),
+            &Grace::default(),
+            now(),
+        );
+        assert_eq!(skip, Err(Skip::UnknownGroup("lodgers".into())));
     }
 
     #[test]
@@ -1318,11 +1388,7 @@ mod tests {
         let mut g = person("g", &["residents"], &[], None);
         let entered = id("@g:matrix.org");
         g.accounts.push(entered.clone());
-        g.links.push(Link {
-            id: entered,
-            by_admin: true,
-            verified: false,
-        });
+        g.links.push(Link { id: entered });
         let mut r = Remembered::default();
         let mut current = room(&["@g:matrix.org"]);
         // no choice: every account stays, however long (there is nothing to hand over to)

@@ -372,10 +372,27 @@ The house-infra exporter (`house-exporters bot-status`) reads only this file per
 The design is house-infra's docs/HOUSE-DIRECTORY.md; here what lives in this crate (feature
 `directory`):
 
-- `directory`: `People` (a person keyed by the provider's uuid; house account, links an admin
-  entered or the person proved, their chosen account), `Contact` (chosen, unchosen, invalid;
+- `directory`: `People` (a person keyed by the provider's uuid; house account, links
+  (`matrix_ids`: entered by an admin or proved with a code, the same), their chosen account), `Contact` (chosen, unchosen, invalid;
   the house account is never chosen for anyone), conflicts (an account two active people claim
   counts for nobody), `Snapshot` (one read, its age, `is_stale`). A read is all or nothing.
+- Groups (2026-10-31): the directory says who is in which group, the bots' configs what a
+  group means. The house's model: `residents` are the full members (house plenum, finance,
+  shared passwords); `subtenants` live here for a while with a kitchen of their own (its group:
+  its room, plenum, calendar and cleaning plan) and nothing of the house plenum. "Lives here"
+  is in either: cleaning-bot's `[directory] residents_group` takes a list (any of them; one
+  name still works), plenum-bot's `[members] subtenant_groups` lets them into the kitchens'
+  rooms, whose `membership::Rule::require` is therefore a list (in any of them; empty: no
+  rule; every group named must be known, else `Skip::UnknownGroup`). "Full member" is
+  `residents` alone: the house plenum's room, private plenums (finance). Link requests and
+  direct chats (`rooms::known_accounts`) follow the managed groups, so a subtenant in a
+  kitchen's group may link accounts and write to plenum-bot like a resident.
+- `Person::stay_until` (2026-10-31, `[directory] stay_until_attribute`, default `stay_until`):
+  the last day of a person's stay, "YYYY-MM-DD" (or a timestamp starting with that date, as a
+  YAML editor may store it), read for everyone (deactivated people too: the consumer skips
+  them); unset, empty or unreadable is None with a debug log, never a failed read. Nothing in
+  this crate acts on it: plenum-bot reminds the admins before it, on the day and when overdue
+  (its `stay` module); nobody is locked or removed for it.
 - `link`: the link code a person gets from the directory bot for `!link <username>` and enters
   in the provider's flow; the provider computes the same code (shared test vectors).
 - `membership`: the pure plan of a room that follows directory groups, its guards (stale or
