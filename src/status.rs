@@ -25,7 +25,8 @@
 //!  "tasks": [{"name": "imap sync", "kind": "ticking", "expected_interval_s": 300, "within_s": 600,
 //!             "last_tick": 1761900020, "last_ok": 1761900020, "last_err": null, "last_err_reason": null,
 //!             "consecutive_failures": 0, "ok_total": 3, "failed_total": 0, "idle_total": 10,
-//!             "gave_up_total": 0, "last_gave_up": null, "last_outcome": "idle", "next_due": null}],
+//!             "gave_up_total": 0, "last_gave_up": null, "unavailable_total": 0,
+//!             "last_outcome": "idle", "next_due": null}],
 //!  "queues": [{"name": "email retry", "pending": 0, "oldest_age_s": null}],
 //!  "gauges": [{"name": "members_held_rooms", "value": 2.0}]}
 //! ```
@@ -33,8 +34,10 @@
 //! `last_ok` is the last healthy round, [`Alive::ok`](crate::supervise::Alive::ok) or
 //! [`Alive::idle`](crate::supervise::Alive::idle); `gave_up_total` is counted in
 //! `failed_total` too, `last_gave_up` is the last give-up (seen even when it came before a
-//! reader's first look at the totals). New fields may be added within version 1 (`last_gave_up`
-//! was); readers ignore unknown ones.
+//! reader's first look at the totals). `unavailable_total` counts the rounds another service
+//! was down ([`Alive::unavailable`](crate::supervise::Alive::unavailable), in `failed_total`
+//! too; `last_outcome` "unavailable"). New fields may be added within version 1
+//! (`last_gave_up`, `unavailable_total` were); readers ignore unknown ones.
 
 use std::{
     path::{Path, PathBuf},
@@ -294,6 +297,7 @@ pub struct TaskDoc {
     pub idle_total: u64,
     pub gave_up_total: u64,
     pub last_gave_up: Option<u64>,
+    pub unavailable_total: u64,
     pub last_outcome: Option<&'static str>,
     pub next_due: Option<u64>,
 }
@@ -365,6 +369,7 @@ fn task_doc(task: TaskStatus) -> TaskDoc {
         idle_total: task.idle_total,
         gave_up_total: task.gave_up_total,
         last_gave_up: unix(task.last_gave_up),
+        unavailable_total: task.unavailable_total,
         last_outcome: task.last_outcome.map(supervise::Outcome::as_str),
         next_due: unix(task.next_due),
     }

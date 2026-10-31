@@ -12,7 +12,12 @@
 //! the heartbeat file, the health check fails and health-bot reports the container unhealthy.
 //! A loop that sleeps until a date (a monthly summary) uses [`supervise`] without ticks.
 //! A loop that can fail a round reports it with [`Alive::ok`] / [`Alive::failed`]: failing for
-//! longer than its time counts as unhealthy too.
+//! longer than its time counts as unhealthy too. A round that could not run because another
+//! service is down (the directory unreachable, timing out or answering 5xx/429) is
+//! [`Alive::unavailable`]: failed for the status file and its alerts, but it neither starts
+//! nor ends a run of failures, so an outage alone marks no bot as broken. A service that
+//! refuses the bot (a revoked token) or answers what the bot cannot read is no outage: that is
+//! [`Alive::failed`], a broken config or bot.
 //!
 //! Not for tasks that end by design (per request, one-shot, a test mode that posts once):
 //! those can still count their rounds for the status file with [`report`].
@@ -153,6 +158,22 @@ impl Alive {
         self.failure(Outcome::GaveUp, &reason.to_string());
     }
 
+    /// A round that could not run because a service the bot depends on is down (the house
+    /// directory unreachable, timing out, answering 5xx or 429): a failed round for the status
+    /// file and its alerts (counted as unavailable too), but for the heartbeat it neither
+    /// starts nor ends a run of failures. An outage alone never makes the task unhealthy: the
+    /// bot itself works, restarting it or calling it unhealthy would help nobody, and the
+    /// service's own monitoring reports the outage. A real failure before it keeps counting
+    /// (a run that began with [`failed`](Self::failed) turns unhealthy after its time even if
+    /// an outage follows), and only [`ok`](Self::ok) or [`idle`](Self::idle) ends it.
+    ///
+    /// Only for outages: a service that refuses the bot (401/403, a revoked token) or answers
+    /// something it cannot read (a changed schema) is a config or bot bug, [`failed`](Self::failed)
+    /// (for the directory: [`crate::directory::is_outage`] tells them apart).
+    pub fn unavailable(&self, reason: impl std::fmt::Display) {
+        self.failure(Outcome::Unavailable, &reason.to_string());
+    }
+
     /// The task's work should succeed ([`ok`](Self::ok) or [`idle`](Self::idle)) at least
     /// this often: a daily job says a day, a poller its interval. For the status file and the
     /// alerts built on it only; the heartbeat keeps following `within`.
@@ -194,22 +215,32 @@ impl Alive {
         let now = SystemTime::now();
         state.last = Instant::now();
         state.last_tick = Some(now);
-        let since = state
-            .failing
-            .as_ref()
-            .map_or_else(Instant::now, |(since, _)| *since);
-        state.failing = Some((since, reason.clone()));
+        if outcome != Outcome::Unavailable {
+            let since = state
+                .failing
+                .as_ref()
+                .map_or_else(Instant::now, |(since, _)| *since);
+            state.failing = Some((since, reason.clone()));
+        }
         state.last_err = Some(now);
         state.last_err_reason = Some(reason);
         state.consecutive_failures += 1;
         state.failed_total += 1;
-        if outcome == Outcome::GaveUp {
-            state.gave_up_total += 1;
-            state.last_gave_up = Some(now);
-            // Given up for good: nothing is being retried, so the task is not failing now
-            // (the heartbeat would stay unhealthy until a daily job's next round); the status
-            // file and its alert keep the give-up.
-            state.failing = None;
+        match outcome {
+            Outcome::GaveUp => {
+                state.gave_up_total += 1;
+                state.last_gave_up = Some(now);
+                // Given up for good: nothing is being retried, so the task is not failing now
+                // (the heartbeat would stay unhealthy until a daily job's next round); the
+                // status file and its alert keep the give-up.
+                state.failing = None;
+            }
+            Outcome::Unavailable => {
+                // Another service is down, not this task: the status file and its alerts
+                // show it; a run of real failures before it goes on (left as it was above).
+                state.unavailable_total += 1;
+            }
+            _ => {}
         }
         state.last_outcome = Some(outcome);
     }
@@ -258,6 +289,7 @@ pub enum Outcome {
     Idle,
     Failed,
     GaveUp,
+    Unavailable,
 }
 
 impl Outcome {
@@ -267,6 +299,7 @@ impl Outcome {
             Self::Idle => "idle",
             Self::Failed => "failed",
             Self::GaveUp => "gave_up",
+            Self::Unavailable => "unavailable",
         }
     }
 }
@@ -295,6 +328,7 @@ struct State {
     idle_total: u64,
     gave_up_total: u64,
     last_gave_up: Option<SystemTime>,
+    unavailable_total: u64,
     last_outcome: Option<Outcome>,
     expected: Option<Duration>,
     next_due: Option<SystemTime>,
@@ -321,6 +355,8 @@ pub struct TaskStatus {
     /// The last [`Alive::gave_up`]: a give-up is seen even when it came before the first
     /// look at the totals (a counter that starts at 1 shows no increase).
     pub last_gave_up: Option<SystemTime>,
+    /// [`Alive::unavailable`] rounds; also counted in `failed_total`.
+    pub unavailable_total: u64,
     pub last_outcome: Option<Outcome>,
     pub next_due: Option<SystemTime>,
 }
@@ -346,6 +382,7 @@ pub fn snapshot() -> Vec<TaskStatus> {
                 idle_total: state.idle_total,
                 gave_up_total: state.gave_up_total,
                 last_gave_up: state.last_gave_up,
+                unavailable_total: state.unavailable_total,
                 last_outcome: state.last_outcome,
                 next_due: state.next_due,
             }
@@ -390,6 +427,7 @@ fn new_slot(name: String, kind: Kind, within: Option<Duration>) -> Arc<Slot> {
             idle_total: 0,
             gave_up_total: 0,
             last_gave_up: None,
+            unavailable_total: 0,
             last_outcome: None,
             expected: None,
             next_due: None,
@@ -547,6 +585,74 @@ mod tests {
             (t.gave_up_total, t.last_outcome),
             (1, Some(Outcome::GaveUp))
         );
+    }
+
+    #[test]
+    fn an_unavailable_service_is_failed_in_the_status_but_never_unhealthy() {
+        let alive = register(
+            "directory under test".into(),
+            Kind::Ticking,
+            Some(Duration::from_secs(600)),
+        );
+        let mine = |at| {
+            unhealthy_at(at)
+                .into_iter()
+                .any(|u| u.name == "directory under test")
+        };
+        // the directory is down for hours: every round says so, the bot stays healthy
+        for _ in 0..50 {
+            alive.unavailable("directory: connection refused");
+        }
+        assert!(lock(&alive.0.state).failing.is_none(), "no run of failures");
+        assert!(!mine(Instant::now()));
+        let t = status_of("directory under test");
+        assert_eq!(
+            (t.failed_total, t.unavailable_total, t.consecutive_failures),
+            (50, 50, 50)
+        );
+        assert_eq!(t.last_outcome, Some(Outcome::Unavailable));
+        assert_eq!(
+            t.last_err_reason.as_deref(),
+            Some("directory: connection refused")
+        );
+        alive.ok();
+        assert_eq!(status_of("directory under test").consecutive_failures, 0);
+    }
+
+    #[test]
+    fn a_failure_followed_by_an_outage_still_turns_unhealthy_after_its_time() {
+        let alive = register(
+            "reader under test".into(),
+            Kind::Ticking,
+            Some(Duration::from_secs(600)),
+        );
+        let mine = |at| {
+            unhealthy_at(at)
+                .into_iter()
+                .find(|u| u.name == "reader under test")
+        };
+        // a refused token: a real failure, then the service goes down as well
+        alive.failed("directory: 403 Forbidden");
+        let started = Instant::now()
+            .checked_sub(Duration::from_secs(660))
+            .unwrap();
+        lock(&alive.0.state).failing.as_mut().unwrap().0 = started;
+        for _ in 0..3 {
+            alive.unavailable("directory: connection refused");
+        }
+        // the run of failures is neither ended nor restarted by the outage
+        let late = mine(Instant::now()).expect("failing too long");
+        assert_eq!(late.why, "failing for 11 min: directory: 403 Forbidden");
+        let t = status_of("reader under test");
+        assert_eq!(
+            (t.consecutive_failures, t.unavailable_total, t.last_outcome),
+            (4, 3, Some(Outcome::Unavailable))
+        );
+        // only a good round ends it
+        alive.idle();
+        assert_eq!(mine(Instant::now()), None);
+        alive.unavailable("directory: timed out");
+        assert!(lock(&alive.0.state).failing.is_none());
     }
 
     #[test]

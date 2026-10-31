@@ -12,7 +12,7 @@ use tracing::{info, warn};
 use crate::{
     admin::AdminConsole,
     config::{MatrixConfig, SecurityConfig},
-    rooms::{self, DynamicRooms, InvitePolicy},
+    rooms::{self, DmAccounts, DynamicRooms, InvitePolicy},
     session,
     settings::SettingsStore,
     sync,
@@ -128,6 +128,7 @@ impl BotBuilder {
             dynamic_rooms: self.dynamic_rooms,
             admins: admin_list.clone(),
             dm_rooms: Arc::clone(&dm_rooms),
+            dm_accounts: DmAccounts::default(),
         };
         rooms::install_invite_handler(&client, invites.clone());
 
@@ -198,6 +199,20 @@ impl Bot {
             crate::trust::accept_changed_in_rooms(&self.client).await;
         }
         rooms::join_pending_invites(&self.client, &self.invites).await;
+    }
+
+    /// Pending invites once more (as [`Bot::initial_sync`] does): for a bot that held
+    /// direct-chat invites until its first directory read ([`DmAccounts::wait_for_first_read`]),
+    /// right after that read.
+    pub async fn process_pending_invites(&self) {
+        rooms::join_pending_invites(&self.client, &self.invites).await;
+    }
+
+    /// The accounts that may open a direct chat with the bot for a while, besides the admins
+    /// and `dm_rooms` (a bot that reads the directory fills it; shared with the invite
+    /// handler).
+    pub fn dm_accounts(&self) -> &DmAccounts {
+        &self.invites.dm_accounts
     }
 
     /// Sync until SIGTERM/SIGINT, then return so `main` can exit cleanly

@@ -347,8 +347,14 @@ mount. `status` adds a file of its own, independent of Matrix:
   token-like words removed), failures in a row, totals ok/idle/failed/gave_up, the last
   give-up's time, last outcome, expected interval, next due.
 - `Alive`: `tick`, `ok`, `failed` as before; new `idle()` (nothing to do: healthy),
-  `gave_up(reason)` (counted as failed too), `expect_every(Duration)` (status only; the
-  heartbeat still follows `within`), `next_due(Option<SystemTime>)`.
+  `gave_up(reason)` (counted as failed too), `unavailable(reason)` (another service is down:
+  failed and counted as unavailable in the status file, but for the heartbeat it neither
+  starts nor ends a run of failures, so an outage alone never makes a task unhealthy and a
+  real failure before it still does after its time), `expect_every(Duration)` (status only;
+  the heartbeat still follows `within`), `next_due(Option<SystemTime>)`. `unavailable` is for
+  outages only: `directory::is_outage` tells a directory that is down (connect error, timeout,
+  a body broken off, 5xx, 429) from one that refuses the token (401/403), a wrong URL or API
+  (400/404) or an answer the bot cannot read, which stay `failed`.
 - `schedule::run`: Done → ok, Skipped → idle, RetryIn → failed, a slot past its catch-up window
   or an at-most-once slot that failed → gave_up, ledger errors → failed; the rule's interval
   (a day, a week, 31 days) as the expected one, the next due slot (the pending one while it is
@@ -376,6 +382,60 @@ The design is house-infra's docs/HOUSE-DIRECTORY.md; here what lives in this cra
   failed read, empty house group, unknown group, mass-removal hold confirmed by digest) and
   what is remembered between rounds. plenum-bot does the Matrix side; cleaning-bot keeps its
   own reconcile for the plan (same ideas; a shared helper is a follow-up).
+  One account per person and room: a wanted person who chose keeps only the chosen account;
+  their other recognised accounts in the room (house account, links, an older choice) are
+  outgoing and stay for a handover (`Handover`, `Grace`): until 7 days after the bot first
+  saw the chosen account *joined* there, at most 30 days after it first saw the choice there
+  (an invitation never accepted does not keep the old account for good). Then they are
+  removed like any other account (kick with the chosen account named, counted against the
+  mass-removal limit, held and confirmed the same way), but only while the chosen account is
+  in the room (joined or invited): a handover never removes a person's last account there.
+  While another account of the person is in the room and the chosen one is not, the chosen
+  one is invited once more per handover (`Handover::invited`), even if it was invited before
+  (declined, joined and left, an older image's invitation), still at most once a day after a
+  failed invitation; if it is still not there (failed, declined again) the outgoing accounts
+  stay, and `Handover::presence` (joined, invited, absent) says why in `!members` and in the
+  person's notice (an invitation waiting, or not in the room). A room admin (power level 100)
+  and the keep list still never go, a claimed account stays frozen. Who has not chosen (or chose
+  something unusable) keeps every account: there is nothing to hand over to. `Remembered`
+  keeps each wanted chooser's handover per room (`handover`, written only when non-empty, so
+  an older image reads the file and ignores it); a new choice starts a new one, and an
+  account given up is forgotten as invited once it is gone, so choosing it again invites it
+  again. The first round after the upgrade starts every handover then: nobody is removed
+  before the grace. `Notices::handover` remembers whom the bot told (once per choice).
 - `admin::Admins`: the configured admins plus, with `[security] admin_groups`, the house
   accounts of those groups' members while the last read is fresh. Shared by the admin console
   and the invite policy; a linked account is never an admin.
+- Link requests (`directory::LinkRequest`, `[directory] link_request_attribute`, default
+  `matrix_link_request`): the flow `house-matrix-accounts` writes `{"id": "@x:server", "at":
+  <unix s>}` on a logged-in person who named an account without a code (one per person,
+  removed when the link succeeds). `Directory::link_requests(groups)` reads only them, and
+  only of the active people in one of `groups` (the groups whose rooms the bot manages;
+  plenum-bot: its plenums' `group` and `require_group`, so a guest or a former resident whose
+  user is still active asks for nothing): active users with their groups, with Authentik's
+  `attributes={"matrix_link_request__isnull": false}` filter (verified on 2026.8.5;
+  `LINK_REQUEST_FILTER` switches it off, an attribute name a Django lookup cannot carry goes
+  without it, a 400 falls back to every active user, remembered for the life of the process
+  with one warning). The requests are picked out of the answer either way, a malformed value
+  is no request, and the read is no part of a `Snapshot` (not all or nothing; it decides
+  nothing about rooms or rights). Fresh: younger than a slot, at most 5 minutes ahead
+  (`LinkRequest::is_fresh`). A request carries the person's login, not their shown name: the
+  bot writes to an account anyone may name, and a name the person edits would carry their
+  text into that message.
+- `rooms::DmAccounts` (in `InvitePolicy`, `Bot::dm_accounts`): accounts that may open a
+  private direct chat besides the admins and `dm_rooms`, like `Admins`' part from the groups
+  an expiring shared set: every account the directory recognises as an active person's in
+  one of the bot's groups (`known_accounts(people, groups)`: `People::accounts`, conflicts,
+  deactivated people and people outside those groups out), until the read's time plus
+  `stale_after` (`follow(snapshot, cfg, groups)`), and the account of each fresh link request
+  (of those people, as read) off the house's server, until its time plus a slot (`announce`). Such an invite is joined and
+  kept only if `is_private_dm` (as with `dm_rooms`). `InvitePolicy::plan` is the pure
+  decision. A bot that fills the set calls `wait_for_first_read` before its first sync:
+  until the first `set_known`, a direct-chat invite nobody else allows stays pending instead
+  of being rejected, and `Bot::process_pending_invites` after that read takes it up (also
+  the ones from before the start). plenum-bot fills it and sends the codes (its
+  `link_delivery`, which names only the asking login, as code, and writes to one account at
+  most 3 times a day whoever asks); what a non-admin may do in such a chat is the bot's
+  business (plenum-bot: `!link` only; its own room, where `!plenum` gives the overview, is
+  known by the room ID its homeserver resolves the bot's alias to, never by the
+  `m.room.canonical_alias` a room names itself).

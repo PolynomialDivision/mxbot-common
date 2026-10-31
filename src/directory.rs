@@ -25,11 +25,25 @@
 //! A read is all or nothing: an answer without anyone, without the users' groups or ids, or
 //! one that changed between its pages is an error, and a bot changes nothing on an error.
 //! [`Snapshot::is_stale`] tells a bot when its last good read is too old to act on.
+//!
+//! Link requests ([`LinkRequest`], `matrix_link_request`): the provider's flow writes one on a
+//! logged-in person who named an account on another server without a code; the directory bot
+//! then invites that account to a direct chat and sends the code there ([`crate::link`]).
+//! [`Directory::link_requests`] reads only them, often and cheaply, and only of the people in
+//! the groups a bot names (the ones whose rooms it manages: guests and former residents ask
+//! for nothing); it is no part of a [`Snapshot`] and nothing about rooms or rights follows
+//! from it.
+//!
+//! Errors: [`is_outage`] tells a provider that is down (unreachable, timing out, 5xx, 429)
+//! from one that refuses the bot or answers what it cannot read; only the first is another
+//! service's outage (`Alive::unavailable`), the rest a broken config or bot.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{bail, Context, Result};
+use chrono::{DateTime, Utc};
 use matrix_sdk::ruma::{OwnedUserId, UserId};
 use serde::Deserialize;
 use tracing::warn;
@@ -56,6 +70,10 @@ pub struct DirectoryConfig {
     /// User attribute with the person's chosen account.
     #[serde(default = "default_preferred_attribute")]
     pub preferred_attribute: String,
+    /// User attribute with the person's open link request (`{"id": "@x:server", "at": <unix
+    /// seconds>}`), written by the provider's flow, removed when the link succeeds.
+    #[serde(default = "default_link_request_attribute")]
+    pub link_request_attribute: String,
     /// Environment variable with the read-only API token.
     #[serde(default = "default_token_env")]
     pub token_env: String,
@@ -84,6 +102,10 @@ fn default_verified_attribute() -> String {
 
 fn default_preferred_attribute() -> String {
     "matrix_preferred".to_owned()
+}
+
+fn default_link_request_attribute() -> String {
+    "matrix_link_request".to_owned()
 }
 
 fn default_token_env() -> String {
@@ -220,6 +242,15 @@ impl People {
         }
     }
 
+    /// The active people claiming `account` (none, one, or a conflict's several).
+    pub fn claimants<'a>(&'a self, account: &UserId) -> impl Iterator<Item = &'a Person> + 'a {
+        self.claims
+            .get(account)
+            .into_iter()
+            .flatten()
+            .map(|i| &self.all[*i])
+    }
+
     pub fn is_conflict(&self, account: &UserId) -> bool {
         self.claims.get(account).is_some_and(|c| c.len() > 1)
     }
@@ -297,6 +328,147 @@ impl Snapshot {
     }
 }
 
+/// How far in the future a link request's time may be (the provider's clock ahead of ours).
+pub const LINK_REQUEST_AHEAD: Duration = Duration::from_secs(5 * 60);
+
+/// An open link request: a logged-in person named `account` in the provider's flow
+/// `house-matrix-accounts` without a code, so the directory bot invites that account to a
+/// direct chat and sends it the code ([`crate::link::code`] for `username` and `account`).
+/// One per person; a new one replaces the old, a successful link removes it. Read on its own
+/// ([`Directory::link_requests`]), not with a [`Snapshot`]: it says who asked, never who owns
+/// what.
+///
+/// It carries no shown name on purpose: the bot writes to an account anyone may name, and a
+/// name the person edits themselves would put their text (links, lines) into that message.
+/// Only the login, which the person cannot change, says who asked.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LinkRequest {
+    /// The provider's id of the person who asked ([`Person::id`]).
+    pub person: String,
+    /// Their login: the code is for it, and it is all the requested account is told of them.
+    pub username: String,
+    /// The account to link (any server; the bot checks which it serves).
+    pub account: OwnedUserId,
+    /// When the person asked (the provider's clock).
+    pub at: DateTime<Utc>,
+    /// The accounts the person proved already (`verified_attribute`, on other servers).
+    pub verified: Vec<OwnedUserId>,
+}
+
+impl LinkRequest {
+    /// Asked less than a slot ([`crate::link::SLOT_SECONDS`]) ago and not more than
+    /// [`LINK_REQUEST_AHEAD`] in the future: an older one is stale (the person has given up or
+    /// asks again), and a time further ahead is a broken value.
+    pub fn is_fresh(&self, now: SystemTime) -> bool {
+        let at = SystemTime::from(self.at);
+        match now.duration_since(at) {
+            Ok(age) => age < Duration::from_secs(crate::link::SLOT_SECONDS),
+            Err(ahead) => ahead.duration() <= LINK_REQUEST_AHEAD,
+        }
+    }
+
+    /// Until when it counts: a slot after it was made.
+    pub fn until(&self) -> SystemTime {
+        SystemTime::from(self.at) + Duration::from_secs(crate::link::SLOT_SECONDS)
+    }
+
+    /// The key that tells one request from the next (a new one replaces the old: another
+    /// account, or the same one asked again later).
+    pub fn key(&self) -> String {
+        format!("{} {} {}", self.person, self.account, self.at.timestamp())
+    }
+}
+
+/// The value of the link-request attribute: `{"id": "@x:server", "at": <unix seconds>}`.
+/// Anything else (no object, no valid Matrix ID, no time or a time that is no whole number of
+/// seconds a date can hold) is no request: `None`, never an error.
+fn link_request_value(value: &serde_json::Value) -> Option<(OwnedUserId, DateTime<Utc>)> {
+    let object = value.as_object()?;
+    let account = UserId::parse(object.get("id")?.as_str()?.trim()).ok()?;
+    let at = match object.get("at")? {
+        serde_json::Value::Number(n) => n
+            .as_i64()
+            .or_else(|| n.as_f64().filter(|f| f.fract() == 0.0).map(|f| f as i64))?,
+        _ => return None,
+    };
+    Some((account, DateTime::from_timestamp(at, 0)?))
+}
+
+/// The link requests of active non-service users in one of `groups` (the groups whose rooms
+/// the bot manages; none: nobody's). Never fails: a user without a request, with one that
+/// cannot be read, or outside those groups (a guest, a former resident, a user whose groups
+/// the answer lacks) is left out.
+fn link_requests_of(
+    users: &[User],
+    cfg: &DirectoryConfig,
+    server_name: &str,
+    groups: &BTreeSet<String>,
+) -> Vec<LinkRequest> {
+    users
+        .iter()
+        .filter(|u| u.is_active && !u.kind.contains("service_account"))
+        .filter(|u| !u.uuid.trim().is_empty())
+        .filter(|u| {
+            u.groups_obj
+                .iter()
+                .flatten()
+                .any(|g| groups.contains(&g.name))
+        })
+        .filter_map(|u| {
+            let (account, at) = link_request_value(u.attributes.get(&cfg.link_request_attribute)?)?;
+            let house = house_account(u, cfg, server_name);
+            let verified = links_of(u, cfg, server_name, house.as_deref())
+                .into_iter()
+                .filter(|l| l.verified)
+                .map(|l| l.id)
+                .collect();
+            Some(LinkRequest {
+                person: u.uuid.trim().to_owned(),
+                username: u.username.clone(),
+                account,
+                at,
+                verified,
+            })
+        })
+        .collect()
+}
+
+/// Whether [`Directory::link_requests`] asks Authentik for only the users with a request
+/// (`attributes={"<attribute>__isnull": false}`, a filter Authentik 2026.8 has). Switched off,
+/// or for an attribute name a filter cannot carry, it reads every active user; the answer is
+/// read the same either way, so a provider that ignores the filter changes nothing.
+const LINK_REQUEST_FILTER: bool = true;
+
+/// The users' query for [`Directory::link_requests`]: active users with their groups (only
+/// people in the bot's groups may ask), and with `filter` only those with the attribute set.
+fn link_request_query(attribute: &str, filter: bool) -> String {
+    let plain = "core/users/?is_active=true&include_groups=true".to_owned();
+    // A Django lookup: a name with `__` or other characters would be read as more than a key.
+    let usable = !attribute.is_empty()
+        && !attribute.contains("__")
+        && attribute
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if !filter || !usable {
+        return plain;
+    }
+    let json = format!("{{\"{attribute}__isnull\":false}}");
+    format!("{plain}&attributes={}", percent_encode(&json))
+}
+
+/// Percent-encoding of a query value (all but the unreserved characters).
+fn percent_encode(value: &str) -> String {
+    value
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
 /// The members' accounts of some groups.
 pub type Groups = BTreeMap<String, BTreeSet<OwnedUserId>>;
 
@@ -337,6 +509,9 @@ pub struct Directory {
     server_name: String,
     token: String,
     http: reqwest::Client,
+    /// The provider refused the link-request filter once (400): every later read of the
+    /// requests goes without it for the rest of the process, and the warning is logged once.
+    filter_refused: AtomicBool,
 }
 
 impl Directory {
@@ -360,6 +535,7 @@ impl Directory {
             cfg: cfg.clone(),
             token,
             http,
+            filter_refused: AtomicBool::new(false),
         })
     }
 
@@ -409,6 +585,39 @@ impl Directory {
             bail!("the directory names nobody");
         }
         Ok(People::new(people))
+    }
+
+    /// The open link requests ([`LinkRequest`]), fresh or not, of the active people in one of
+    /// `groups` (the groups whose rooms the bot manages; an empty set: nobody's), for a bot
+    /// that sends link codes; cheap enough to ask every few seconds. Not all or nothing like a
+    /// snapshot: it decides nothing about rooms or rights, and a request that cannot be read
+    /// is left out. An answer the provider refuses or that cannot be read is an error.
+    ///
+    /// Authentik is asked for the users with the attribute only ([`LINK_REQUEST_FILTER`]); when
+    /// it refuses that filter (400), every active user is read instead, from then on for the
+    /// life of the process (one warning, not one per read), and the requests are picked out
+    /// here either way.
+    pub async fn link_requests(&self, groups: &BTreeSet<String>) -> Result<Vec<LinkRequest>> {
+        let DirectoryProvider::Authentik = self.cfg.provider;
+        let attribute = &self.cfg.link_request_attribute;
+        let filter = LINK_REQUEST_FILTER && !self.filter_refused.load(Ordering::Relaxed);
+        let filtered = link_request_query(attribute, filter);
+        let users: Vec<User> = match self.all_pages(&filtered, "users").await {
+            Err(e) if filtered.contains("&attributes=") && is_bad_request(&e) => {
+                if !self.filter_refused.swap(true, Ordering::Relaxed) {
+                    warn!("Directory: the link-request filter was refused ({e:#}); reading every active user from now on");
+                }
+                self.all_pages(&link_request_query(attribute, false), "users")
+                    .await?
+            }
+            read => read?,
+        };
+        Ok(link_requests_of(
+            &users,
+            &self.cfg,
+            &self.server_name,
+            groups,
+        ))
     }
 
     /// Which of `wanted` exist in the directory, whether anyone is in them or not (a group
@@ -486,6 +695,34 @@ impl Directory {
         }
         bail!("the directory has more than 50 pages of {what}")
     }
+}
+
+/// Whether a directory error is an outage of the provider, not a fault of the bot or its
+/// config: it could not be reached (connect, DNS), timed out, broke off while answering, or
+/// answered 5xx (down, overloaded, a proxy without its backend) or 429 (too many requests).
+/// Everything else is no outage: a refusal (401/403: a revoked or wrong token; 400, 404: a
+/// wrong URL or API), an answer that cannot be read (a changed schema), and what a read finds
+/// wrong itself (nobody in it, no groups, a list that changed while it was read). A bot reports
+/// an outage as `Alive::unavailable` (never unhealthy) and the rest as `Alive::failed`, which
+/// turns unhealthy after its time: those need someone to fix the bot or its config.
+pub fn is_outage(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .filter_map(|e| e.downcast_ref::<reqwest::Error>())
+        .any(|e| match e.status() {
+            Some(status) => {
+                status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+            }
+            None => e.is_connect() || e.is_timeout() || e.is_request() || e.is_body(),
+        })
+}
+
+/// The provider answered 400: it does not take the query (an unknown filter, say).
+fn is_bad_request(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .filter_map(|e| e.downcast_ref::<reqwest::Error>())
+        .any(|e| e.status() == Some(reqwest::StatusCode::BAD_REQUEST))
 }
 
 #[derive(Deserialize, Debug)]
@@ -693,6 +930,8 @@ mod tests {
         assert_eq!(c.refresh(), Duration::from_secs(900));
         assert_eq!(c.verified_attribute, "matrix_verified");
         assert_eq!(c.preferred_attribute, "matrix_preferred");
+        // a config from before link requests: the default attribute
+        assert_eq!(c.link_request_attribute, "matrix_link_request");
         assert_eq!(c.stale_after(), Duration::from_secs(3600));
         assert!(c.server_name.is_none());
     }
@@ -1162,5 +1401,318 @@ mod tests {
         assert_eq!(snap.groups, ["residents".to_owned()].into());
         assert_eq!(dir.people().await.unwrap().len(), 1);
         assert_eq!(dir.server_name(), "house.org");
+    }
+
+    fn requests(users: serde_json::Value) -> Vec<LinkRequest> {
+        let users: Vec<User> = serde_json::from_value(users).unwrap();
+        link_requests_of(&users, &cfg(), "house.org", &managed())
+    }
+
+    /// The groups whose rooms the bot manages, in the link-request tests.
+    fn managed() -> BTreeSet<String> {
+        ["residents".to_owned(), "kitchen-floor-1".to_owned()].into()
+    }
+
+    #[test]
+    fn a_link_request_is_an_id_and_a_time_and_anything_else_is_none() {
+        let at = |s: i64| DateTime::from_timestamp(s, 0).unwrap();
+        let value = |v: serde_json::Value| link_request_value(&v);
+        assert_eq!(
+            value(serde_json::json!({"id": " @anna:matrix.org ", "at": 1_800_000_000})),
+            Some((id("@anna:matrix.org"), at(1_800_000_000)))
+        );
+        // a whole number written as a float is still one
+        assert_eq!(
+            value(serde_json::json!({"id": "@anna:matrix.org", "at": 1_800_000_000.0})),
+            Some((id("@anna:matrix.org"), at(1_800_000_000)))
+        );
+        for broken in [
+            serde_json::json!("@anna:matrix.org"),
+            serde_json::json!(["@anna:matrix.org", 1_800_000_000]),
+            serde_json::json!(null),
+            serde_json::json!({"id": "@anna:matrix.org"}),
+            serde_json::json!({"at": 1_800_000_000}),
+            serde_json::json!({"id": "anna", "at": 1_800_000_000}),
+            serde_json::json!({"id": 5, "at": 1_800_000_000}),
+            serde_json::json!({"id": "@anna:matrix.org", "at": "1800000000"}),
+            serde_json::json!({"id": "@anna:matrix.org", "at": 1_800_000_000.5}),
+            serde_json::json!({"id": "@anna:matrix.org", "at": 1e300}),
+            serde_json::json!({"id": "@anna:matrix.org", "at": i64::MAX}),
+        ] {
+            assert_eq!(value(broken.clone()), None, "{broken}");
+        }
+    }
+
+    #[test]
+    fn link_requests_of_active_people_with_their_proved_accounts() {
+        let r = requests(serde_json::json!([
+            {"uuid": "u-anna", "username": "anna", "name": " Anna Schmidt ",
+             "groups_obj": [{"name": "residents"}],
+             "attributes": {"matrix_verified": ["@anna:example.org", "@anna:house.org"],
+                            "matrix_ids": ["@anna:admin.org"],
+                            "matrix_link_request": {"id": "@anna:matrix.org", "at": 1_800_000_000}}},
+            {"uuid": "u-ben", "username": "ben", "groups_obj": [{"name": "residents"}],
+             "attributes": {}},
+            {"uuid": "u-cara", "username": "cara", "groups_obj": [{"name": "residents"}],
+             "attributes": {"matrix_link_request": "garbage"}},
+            {"uuid": "u-old", "username": "old", "is_active": false,
+             "groups_obj": [{"name": "residents"}],
+             "attributes": {"matrix_link_request": {"id": "@old:matrix.org", "at": 1_800_000_000}}},
+            {"uuid": "u-svc", "username": "svc", "type": "service_account",
+             "groups_obj": [{"name": "residents"}],
+             "attributes": {"matrix_link_request": {"id": "@svc:matrix.org", "at": 1_800_000_000}}},
+            {"username": "noid", "groups_obj": [{"name": "residents"}],
+             "attributes": {"matrix_link_request": {"id": "@noid:matrix.org", "at": 1_800_000_000}}}
+        ]));
+        assert_eq!(r.len(), 1, "{r:?}");
+        let anna = &r[0];
+        assert_eq!(
+            (anna.person.as_str(), anna.username.as_str()),
+            ("u-anna", "anna")
+        );
+        assert_eq!(anna.account, id("@anna:matrix.org"));
+        // proved links only (not the admin's, never on the house's server)
+        assert_eq!(anna.verified, ids(&["@anna:example.org"]));
+        assert_eq!(anna.key(), "u-anna @anna:matrix.org 1800000000");
+        // another attribute name
+        let mut c = cfg();
+        c.link_request_attribute = "other".into();
+        let users: Vec<User> = serde_json::from_value(serde_json::json!([
+            {"uuid": "1", "username": "a", "groups_obj": [{"name": "kitchen-floor-1"}],
+             "attributes": {"other": {"id": "@a:matrix.org", "at": 5}}}
+        ]))
+        .unwrap();
+        assert_eq!(
+            link_requests_of(&users, &c, "house.org", &managed()).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn only_the_people_of_the_managed_groups_may_ask_for_a_link() {
+        let ask =
+            |n: &str| serde_json::json!({"id": format!("@{n}:matrix.org"), "at": 1_800_000_000});
+        let users = serde_json::json!([
+            {"uuid": "1", "username": "resident", "groups_obj": [{"name": "residents"}],
+             "attributes": {"matrix_link_request": ask("resident")}},
+            {"uuid": "2", "username": "cook", "groups_obj": [{"name": "guests"}, {"name": "kitchen-floor-1"}],
+             "attributes": {"matrix_link_request": ask("cook")}},
+            // a guest and a former resident (still active): the house rooms are not for them
+            {"uuid": "3", "username": "guest", "groups_obj": [{"name": "guests"}],
+             "attributes": {"matrix_link_request": ask("guest")}},
+            {"uuid": "4", "username": "former", "groups_obj": [{"name": "former-residents"}],
+             "attributes": {"matrix_link_request": ask("former")}},
+            {"uuid": "5", "username": "nogroups", "groups_obj": [],
+             "attributes": {"matrix_link_request": ask("nogroups")}},
+            // an answer without the groups: nobody to tell who they are
+            {"uuid": "6", "username": "unknown",
+             "attributes": {"matrix_link_request": ask("unknown")}}
+        ]);
+        let mut names: Vec<String> = requests(users.clone())
+            .into_iter()
+            .map(|r| r.username)
+            .collect();
+        names.sort();
+        assert_eq!(names, ["cook", "resident"]);
+        // a bot that manages no group serves nobody
+        let users: Vec<User> = serde_json::from_value(users).unwrap();
+        assert!(link_requests_of(&users, &cfg(), "house.org", &BTreeSet::new()).is_empty());
+    }
+
+    #[test]
+    fn a_link_request_is_fresh_for_a_slot_and_a_little_ahead() {
+        let request = |at: i64| LinkRequest {
+            person: "1".into(),
+            username: "anna".into(),
+            account: id("@anna:matrix.org"),
+            at: DateTime::from_timestamp(at, 0).unwrap(),
+            verified: Vec::new(),
+        };
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let r = request(1_800_000_000);
+        assert!(r.is_fresh(now));
+        assert!(r.is_fresh(now + Duration::from_secs(1799)));
+        assert!(!r.is_fresh(now + Duration::from_secs(1800)));
+        assert_eq!(r.until(), now + Duration::from_secs(1800));
+        // the provider's clock a little ahead: fine; far ahead: a broken value
+        assert!(request(1_800_000_300).is_fresh(now));
+        assert!(!request(1_800_000_301).is_fresh(now));
+    }
+
+    #[test]
+    fn the_link_request_query_filters_when_the_name_allows() {
+        assert_eq!(
+            link_request_query("matrix_link_request", true),
+            "core/users/?is_active=true&include_groups=true\
+             &attributes=%7B%22matrix_link_request__isnull%22%3Afalse%7D"
+        );
+        for name in ["matrix_link_request", "a__b", "a-b", "a.b", ""] {
+            let q = link_request_query(name, false);
+            assert_eq!(q, "core/users/?is_active=true&include_groups=true");
+            if name != "matrix_link_request" {
+                assert_eq!(link_request_query(name, true), q, "{name}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn link_requests_are_read_with_the_filter_and_without_it_when_refused() {
+        use wiremock::matchers::{method, path, query_param, query_param_is_missing};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        std::env::set_var("MXBOT_TEST_REQUESTS_TOKEN", "secret");
+        let answer = serde_json::json!({
+            "pagination": {"next": 0, "count": 2},
+            "results": [
+                {"uuid": "1", "username": "anna", "groups_obj": [{"name": "residents"}],
+                 "attributes": {"matrix_link_request": {"id": "@anna:matrix.org", "at": 1_800_000_000}}},
+                {"uuid": "2", "username": "ben", "groups_obj": [{"name": "residents"}],
+                 "attributes": {}}
+            ]
+        });
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/core/users/"))
+            .and(query_param("is_active", "true"))
+            .and(query_param("include_groups", "true"))
+            .and(query_param(
+                "attributes",
+                r#"{"matrix_link_request__isnull":false}"#,
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(answer.clone()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let dir = reader(server.uri(), "MXBOT_TEST_REQUESTS_TOKEN");
+        let found = dir.link_requests(&managed()).await.unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].account, id("@anna:matrix.org"));
+
+        // a provider without the filter: refused once, then read without it for good (not
+        // the filter again every round)
+        let refusing = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(query_param(
+                "attributes",
+                r#"{"matrix_link_request__isnull":false}"#,
+            ))
+            .respond_with(ResponseTemplate::new(400))
+            .expect(1)
+            .mount(&refusing)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/core/users/"))
+            .and(query_param("is_active", "true"))
+            .and(query_param_is_missing("attributes"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(answer))
+            .expect(3)
+            .mount(&refusing)
+            .await;
+        let dir = reader(refusing.uri(), "MXBOT_TEST_REQUESTS_TOKEN");
+        for _ in 0..3 {
+            assert_eq!(dir.link_requests(&managed()).await.unwrap().len(), 1);
+        }
+
+        // any other refusal is an error (no second read)
+        let forbidden = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(403))
+            .expect(1)
+            .mount(&forbidden)
+            .await;
+        let dir = reader(forbidden.uri(), "MXBOT_TEST_REQUESTS_TOKEN");
+        let e = dir.link_requests(&managed()).await.unwrap_err();
+        assert!(!is_outage(&e), "a refused token is no outage: {e:#}");
+        // nobody with a request: an empty answer, no error (unlike a snapshot)
+        let none = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"pagination": {"next": 0, "count": 0}, "results": []}),
+            ))
+            .mount(&none)
+            .await;
+        let dir = reader(none.uri(), "MXBOT_TEST_REQUESTS_TOKEN");
+        assert!(dir.link_requests(&managed()).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_outage_is_told_apart_from_a_refusal_or_an_unreadable_answer() {
+        use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
+        std::env::set_var("MXBOT_TEST_OUTAGE_TOKEN", "secret");
+        let read = |status: u16, body: &'static str| async move {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .respond_with(ResponseTemplate::new(status).set_body_string(body))
+                .mount(&server)
+                .await;
+            let dir = reader(server.uri(), "MXBOT_TEST_OUTAGE_TOKEN");
+            dir.snapshot(&BTreeSet::new()).await.unwrap_err()
+        };
+        for status in [500, 502, 503, 504, 429] {
+            let e = read(status, "").await;
+            assert!(is_outage(&e), "{status}: {e:#}");
+        }
+        for status in [400, 401, 403, 404] {
+            let e = read(status, "").await;
+            assert!(!is_outage(&e), "{status}: {e:#}");
+        }
+        // a schema the bot does not know, or a read it finds wrong itself: a bug, no outage
+        let e = read(200, r#"{"users": []}"#).await;
+        assert!(!is_outage(&e), "{e:#}");
+        let e = read(
+            200,
+            r#"{"pagination": {"next": 0, "count": 0}, "results": []}"#,
+        )
+        .await;
+        assert!(!is_outage(&e), "{e:#}");
+        // nobody listening (a port just freed): an outage
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let e = reader(
+            format!("http://127.0.0.1:{port}"),
+            "MXBOT_TEST_OUTAGE_TOKEN",
+        )
+        .snapshot(&BTreeSet::new())
+        .await
+        .unwrap_err();
+        assert!(is_outage(&e), "{e:#}");
+        // a timeout: an outage
+        let slow = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(5)))
+            .mount(&slow)
+            .await;
+        let mut dir = reader(slow.uri(), "MXBOT_TEST_OUTAGE_TOKEN");
+        dir.http = reqwest::Client::builder()
+            .timeout(Duration::from_millis(100))
+            .build()
+            .unwrap();
+        let e = dir.snapshot(&BTreeSet::new()).await.unwrap_err();
+        assert!(is_outage(&e), "{e:#}");
+        // an error without anything from HTTP in it
+        assert!(!is_outage(&anyhow::anyhow!("the directory names nobody")));
+    }
+
+    #[test]
+    fn claimants_name_every_active_person_claiming_an_account() {
+        let p = index(serde_json::json!([
+            {"uuid": "1", "username": "anna", "groups_obj": [],
+             "attributes": {"matrix_verified": ["@shared:matrix.org"]}},
+            {"uuid": "2", "username": "ben", "groups_obj": [],
+             "attributes": {"matrix_ids": ["@shared:matrix.org", "@ben:matrix.org"]}},
+            {"uuid": "3", "username": "gone", "is_active": false, "groups_obj": [],
+             "attributes": {"matrix_ids": ["@gone:matrix.org"]}}
+        ]));
+        let names = |a: &str| {
+            let mut n: Vec<&str> = p.claimants(&id(a)).map(|p| p.id.as_str()).collect();
+            n.sort_unstable();
+            n
+        };
+        assert_eq!(names("@shared:matrix.org"), ["1", "2"]);
+        assert_eq!(names("@ben:matrix.org"), ["2"]);
+        assert!(names("@gone:matrix.org").is_empty());
+        assert!(names("@nobody:matrix.org").is_empty());
     }
 }
