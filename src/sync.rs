@@ -85,10 +85,12 @@ pub async fn initial_sync(client: &Client) {
         match client.sync_once(sync_settings()).await {
             Ok(_) => {
                 info!(attempt, "Initial Matrix sync completed");
+                crate::status::sync_ok();
                 crate::heartbeat::beat().await;
                 return;
             }
             Err(error) => {
+                crate::status::sync_failed();
                 let delay = backoff.next_delay();
                 warn!(attempt, retry_in_secs = delay.as_secs(), %error, "Initial Matrix sync failed");
                 tokio::select! {
@@ -107,17 +109,20 @@ pub async fn initial_sync(client: &Client) {
 /// means it gave up (e.g. an extended homeserver outage).
 ///
 /// `on_reconnect` is called each time the loop restarts. Every successful
-/// sync response refreshes the optional [`crate::heartbeat`] file.
+/// sync response refreshes the optional [`crate::heartbeat`] file and the
+/// last sync in [`crate::status`]; a reconnect counts as a failed attempt.
 pub async fn sync_forever_with(client: &Client, mut on_reconnect: impl FnMut()) -> ! {
     let mut backoff = Backoff::new(RETRY_INITIAL, RETRY_MAX);
     loop {
         let started = Instant::now();
         let result = client
             .sync_with_callback(sync_settings(), |_| async {
+                crate::status::sync_ok();
                 crate::heartbeat::beat().await;
                 LoopCtrl::Continue
             })
             .await;
+        crate::status::sync_failed();
         match result {
             Ok(()) => warn!("Matrix sync loop exited cleanly; reconnecting"),
             Err(error) => warn!(%error, "Matrix sync loop failed; reconnecting"),
@@ -146,6 +151,7 @@ pub async fn sync_until_stopped(client: &Client, mut on_reconnect: impl FnMut())
         let started = Instant::now();
         let result = client
             .sync_with_callback(sync_settings(), |_| async {
+                crate::status::sync_ok();
                 crate::heartbeat::beat().await;
                 if stopping() {
                     LoopCtrl::Break
@@ -157,6 +163,7 @@ pub async fn sync_until_stopped(client: &Client, mut on_reconnect: impl FnMut())
         if stopping() {
             return;
         }
+        crate::status::sync_failed();
         match result {
             Ok(()) => warn!("Matrix sync loop exited cleanly; reconnecting"),
             Err(error) => warn!(%error, "Matrix sync loop failed; reconnecting"),

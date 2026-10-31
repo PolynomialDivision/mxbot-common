@@ -69,8 +69,10 @@ pub struct InvitePolicy {
     /// Rooms allowed at runtime, in addition to `rooms`.
     pub dynamic_rooms: DynamicRooms,
     /// Admins may always invite the bot, and their direct chats bypass the
-    /// room allow-list (their room IDs cannot be known in advance).
-    pub admins: Arc<HashSet<OwnedUserId>>,
+    /// room allow-list (their room IDs cannot be known in advance). The bot's
+    /// shared list ([`crate::admin::Admins`]): the configured admins, and those
+    /// of the directory's admin groups while their read is fresh.
+    pub admins: crate::admin::Admins,
     /// Members of these rooms may open a direct chat with the bot
     /// (`[security] dm_rooms`).
     pub dm_rooms: Arc<Vec<OwnedRoomId>>,
@@ -321,7 +323,7 @@ mod tests {
             inviters,
             rooms,
             dynamic_rooms: DynamicRooms::default(),
-            admins: Arc::new(HashSet::from([user_id!("@admin:example.org").to_owned()])),
+            admins: HashSet::from([user_id!("@admin:example.org").to_owned()]).into(),
             dm_rooms: Arc::default(),
         }
     }
@@ -394,6 +396,37 @@ mod tests {
         let admin = Some(user_id!("@admin:example.org"));
         assert_eq!(p.decide(admin, room, true), InviteDecision::Accept);
         assert_eq!(p.decide(admin, room, false), InviteDecision::RejectRoom);
+    }
+
+    #[test]
+    fn admins_from_the_directory_groups_may_open_a_direct_chat_while_fresh() {
+        use std::time::{Duration, SystemTime};
+        let p = policy(
+            UserAllowList::Only(HashSet::new()),
+            RoomAllowList::Only(HashSet::new()),
+        );
+        let derived = Some(user_id!("@anna:example.org"));
+        let dm = room_id!("!dm:example.org");
+        assert_eq!(p.decide(derived, dm, true), InviteDecision::RejectInviter);
+        // The bot's admin list (shared with its console) follows the directory.
+        let console_list = p.admins.clone();
+        console_list.set_from_groups(
+            HashSet::from([user_id!("@anna:example.org").to_owned()]),
+            SystemTime::now() + Duration::from_secs(3600),
+        );
+        assert_eq!(p.decide(derived, dm, true), InviteDecision::Accept);
+        assert_eq!(p.decide(derived, dm, false), InviteDecision::RejectRoom);
+        // A read too old: back to the configured admins only.
+        console_list.set_from_groups(
+            HashSet::from([user_id!("@anna:example.org").to_owned()]),
+            SystemTime::now() - Duration::from_secs(1),
+        );
+        assert_eq!(p.decide(derived, dm, true), InviteDecision::RejectInviter);
+        assert_eq!(
+            p.decide(Some(user_id!("@admin:example.org")), dm, true),
+            InviteDecision::Accept,
+            "the configured admins stay"
+        );
     }
 
     #[test]

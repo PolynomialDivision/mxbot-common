@@ -23,7 +23,7 @@ use std::{
     future::Future,
     path::PathBuf,
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use anyhow::Result;
@@ -62,6 +62,19 @@ pub enum Rule {
 }
 
 impl Rule {
+    /// How often the rule runs at least, for the status file's expected interval
+    /// ([`crate::supervise::Alive::expect_every`]): a day, a week, 31 days; `None` for a daily
+    /// rule without times.
+    pub fn interval(&self) -> Option<Duration> {
+        const DAY: Duration = Duration::from_secs(24 * 60 * 60);
+        match self {
+            Rule::Daily { at } if at.is_empty() => None,
+            Rule::Daily { .. } => Some(DAY),
+            Rule::Weekly { .. } => Some(7 * DAY),
+            Rule::Monthly { .. } => Some(31 * DAY),
+        }
+    }
+
     /// Every day at `at`.
     pub fn daily(at: TimeOfDay) -> Self {
         Rule::Daily { at: vec![at] }
@@ -548,6 +561,8 @@ pub struct Runner {
     /// The next slot last logged.
     announced: Option<DateTime<Utc>>,
     disabled: bool,
+    /// Where rounds are reported for the status file ([`run`] sets the job's [`Alive`]).
+    report: Option<Alive>,
 }
 
 impl Runner {
@@ -558,7 +573,29 @@ impl Runner {
             handled: None,
             announced: None,
             disabled: false,
+            report: None,
         }
+    }
+
+    /// Report each slot's outcome to `alive` for the status file: done → [`Alive::ok`],
+    /// skipped → [`Alive::idle`], not done → [`Alive::failed`], a slot given up →
+    /// [`Alive::gave_up`]; with the rule's interval as the expected one and the next due slot.
+    /// [`run`] does this with the job's own `Alive`.
+    pub fn report_to(mut self, alive: Alive) -> Self {
+        self.report = Some(alive);
+        self
+    }
+
+    fn report(&self, with: impl FnOnce(&Alive)) {
+        if let Some(alive) = &self.report {
+            with(alive);
+        }
+    }
+
+    fn due_at(&self, at: DateTime<Utc>) {
+        self.report(|alive| {
+            alive.next_due(Some(SystemTime::from(at)));
+        });
     }
 
     /// One round at `now`: run the due slot, if there is one that is not handled. Returns
@@ -576,6 +613,10 @@ impl Runner {
         Fut: Future<Output = Outcome>,
     {
         let Some(rule) = (self.job.rule)() else {
+            self.report(|alive| {
+                alive.set_expected(None);
+                alive.next_due(None);
+            });
             if !self.disabled {
                 info!(job = %self.job.name, "Disabled");
                 self.disabled = true;
@@ -584,6 +625,7 @@ impl Runner {
             return None;
         };
         self.disabled = false;
+        self.report(|alive| alive.set_expected(rule.interval()));
         let zone = self.job.zone;
         let next = rule.next(zone, now)?;
 
@@ -591,6 +633,7 @@ impl Runner {
             Some(slot) if self.handled.as_ref() != Some(&slot) => {
                 if let Some((period, not_before)) = self.retry {
                     if period == slot.period && not_before > now {
+                        self.due_at(slot.at);
                         return Some(not_before.min(next.at));
                     }
                     if period != slot.period {
@@ -600,11 +643,17 @@ impl Runner {
                 match ledger.is_done(&self.job.entry, &slot).await {
                     Ok(true) => self.handled = Some(slot),
                     Ok(false) => {
+                        let at = slot.at;
                         self.execute(ledger, now, slot, work).await;
+                        if self.retry.is_some() {
+                            self.due_at(at);
+                        }
                         return Some(now);
                     }
                     Err(error) => {
                         warn!(job = %self.job.name, "Could not read the ledger: {error:#}");
+                        self.report(|alive| alive.failed("could not read the ledger"));
+                        self.due_at(slot.at);
                         let again = now + TimeDelta::minutes(1);
                         self.retry = Some((slot.period, again));
                         return Some(again.min(next.at));
@@ -619,6 +668,7 @@ impl Runner {
             }
         }
 
+        self.due_at(next.at);
         if self.announced != Some(next.at) {
             let secs = ((next.at - now).num_milliseconds().max(0) + 999) / 1000;
             info!(
@@ -634,6 +684,9 @@ impl Runner {
 
     fn give_up(&mut self, period: Period) {
         warn!(job = %self.job.name, slot = %period, "Not retried any more: its catch-up window is over");
+        self.report(|alive| {
+            alive.gave_up(format!("slot {period} not done in its catch-up window"))
+        });
         self.retry = None;
     }
 
@@ -659,17 +712,30 @@ impl Runner {
             Delivery::AtMostOnce => {
                 if let Err(error) = ledger.mark_done(&self.job.entry, &slot).await {
                     warn!(job = %name, slot = %period, "Not run, could not record it: {error:#}");
+                    self.report(|alive| alive.failed("could not record the slot"));
                     self.retry = Some((period, now + TimeDelta::minutes(1)));
                     return;
                 }
                 self.handled = Some(slot.clone());
                 self.retry = None;
-                if let Outcome::RetryIn(_) = work(slot).await {
-                    warn!(job = %name, slot = %period, "Failed; runs at most once, not retried");
+                match work(slot).await {
+                    Outcome::Done => self.report(Alive::ok),
+                    Outcome::Skipped => self.report(Alive::idle),
+                    Outcome::RetryIn(_) => {
+                        warn!(job = %name, slot = %period, "Failed; runs at most once, not retried");
+                        self.report(|alive| {
+                            alive.gave_up(format!("slot {period} failed; runs at most once"));
+                        });
+                    }
                 }
             }
             Delivery::AtLeastOnce => match work(slot.clone()).await {
-                Outcome::Done | Outcome::Skipped => {
+                outcome @ (Outcome::Done | Outcome::Skipped) => {
+                    self.report(if outcome == Outcome::Done {
+                        Alive::ok
+                    } else {
+                        Alive::idle
+                    });
                     if let Err(error) = ledger.mark_done(&self.job.entry, &slot).await {
                         warn!(job = %name, slot = %period, "Could not record the run: {error:#}");
                     }
@@ -679,6 +745,12 @@ impl Runner {
                 Outcome::RetryIn(after) => {
                     let after = after.max(Duration::from_secs(1));
                     info!(job = %name, slot = %period, "Not done; trying again in {after:?}");
+                    self.report(|alive| {
+                        alive.failed(format!(
+                            "slot {period} not done; trying again in {} s",
+                            after.as_secs()
+                        ));
+                    });
                     let after = TimeDelta::from_std(after).unwrap_or(TimeDelta::MAX);
                     self.retry = Some((period, now.checked_add_signed(after).unwrap_or(now)));
                 }
@@ -691,16 +763,20 @@ impl Runner {
 /// [`crate::supervise::supervise_ticking`] and [`Job::stall_after`]): each round ticks
 /// `alive`, runs `work` for a due slot that `ledger` does not have, and sleeps until the next
 /// slot or retry, [`MAX_SLEEP`] at most, or until the job's settings change.
+///
+/// The status file shows the task as `scheduled`, each slot's outcome reported to `alive`
+/// ([`Runner::report_to`]), the rule's interval as the expected one and the next due slot.
 pub async fn run<L, F, Fut>(job: Job, ledger: L, alive: Alive, work: F)
 where
     L: Ledger,
     F: FnMut(Slot) -> Fut,
     Fut: Future<Output = Outcome>,
 {
-    run_with(job, ledger, move || alive.tick(), work).await
+    alive.mark_scheduled();
+    run_with(job, ledger, Some(alive), work).await
 }
 
-async fn run_with<L, F, Fut>(mut job: Job, ledger: L, tick: impl Fn(), mut work: F)
+async fn run_with<L, F, Fut>(mut job: Job, ledger: L, alive: Option<Alive>, mut work: F)
 where
     L: Ledger,
     F: FnMut(Slot) -> Fut,
@@ -709,8 +785,13 @@ where
     let mut changes = job.changes.take();
     let max_sleep = job.max_sleep;
     let mut runner = Runner::new(job);
+    if let Some(alive) = &alive {
+        runner = runner.report_to(alive.clone());
+    }
     loop {
-        tick();
+        if let Some(alive) = &alive {
+            alive.tick();
+        }
         let wake = runner.round(&ledger, Utc::now(), &mut work).await;
         let pause = wake
             .map_or(max_sleep, |at| {
@@ -1356,6 +1437,119 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn each_slot_is_reported_for_the_status_file() {
+        use crate::supervise::{report, snapshot, Outcome as Round};
+        let status = |name: &str| {
+            snapshot()
+                .into_iter()
+                .find(|t| t.name == name)
+                .expect("listed")
+        };
+        let (ledger, _dir) = open_ledger(false, None).await;
+        let alive = report("schedule report under test");
+        let mut runner = Runner::new(job(Rule::daily(hm(7, 0)), Delivery::AtLeastOnce, 2 * HOUR))
+            .report_to(alive.clone());
+        let quarter = Duration::from_secs(15 * 60);
+        let work = Work::new(&[Outcome::RetryIn(quarter), Outcome::Skipped]);
+
+        // Before the slot: the next due time is today's 07:00 (05:00 UTC), a day expected.
+        work.round(&mut runner, &ledger, "2026-10-12T04:00:00Z")
+            .await;
+        let t = status("schedule report under test");
+        assert_eq!(t.expected, Some(Duration::from_secs(86_400)));
+        assert_eq!(t.next_due, Some(utc("2026-10-12T05:00:00Z").into()));
+        assert_eq!(t.last_outcome, None);
+
+        // Not done: failed, and the slot stays due.
+        work.round(&mut runner, &ledger, "2026-10-12T05:00:00Z")
+            .await;
+        let t = status("schedule report under test");
+        assert_eq!(t.last_outcome, Some(Round::Failed));
+        assert_eq!(t.consecutive_failures, 1);
+        assert_eq!(
+            t.last_err_reason.as_deref(),
+            Some("slot 2026-10-12 not done; trying again in 900 s")
+        );
+        assert_eq!(t.next_due, Some(utc("2026-10-12T05:00:00Z").into()));
+        work.round(&mut runner, &ledger, "2026-10-12T05:05:00Z")
+            .await;
+        assert_eq!(
+            status("schedule report under test").next_due,
+            Some(utc("2026-10-12T05:00:00Z").into()),
+            "waiting for the retry"
+        );
+
+        // Skipped (nothing to post): idle, healthy; the next due is tomorrow.
+        work.round(&mut runner, &ledger, "2026-10-12T05:15:00Z")
+            .await;
+        work.round(&mut runner, &ledger, "2026-10-12T05:16:00Z")
+            .await;
+        let t = status("schedule report under test");
+        assert_eq!(t.last_outcome, Some(Round::Idle));
+        assert_eq!(
+            (t.idle_total, t.failed_total, t.consecutive_failures),
+            (1, 1, 0)
+        );
+        assert_eq!(t.next_due, Some(utc("2026-10-13T05:00:00Z").into()));
+
+        // Tomorrow's slot keeps failing past its catch-up window: given up.
+        let work = Work::new(&[Outcome::RetryIn(HOUR), Outcome::RetryIn(HOUR)]);
+        work.round(&mut runner, &ledger, "2026-10-13T05:00:00Z")
+            .await;
+        work.round(&mut runner, &ledger, "2026-10-13T06:00:00Z")
+            .await;
+        work.round(&mut runner, &ledger, "2026-10-13T07:30:00Z")
+            .await;
+        let t = status("schedule report under test");
+        assert_eq!(t.gave_up_total, 1);
+        assert_eq!(t.last_outcome, Some(Round::GaveUp));
+        assert_eq!(t.next_due, Some(utc("2026-10-14T05:00:00Z").into()));
+    }
+
+    #[tokio::test]
+    async fn a_job_turned_off_expects_nothing() {
+        let (ledger, _dir) = open_ledger(false, None).await;
+        let alive = crate::supervise::report("schedule off under test");
+        alive.expect_every(HOUR);
+        let job = Job::new("off", BERLIN, Delivery::AtLeastOnce, HOUR, || None);
+        let mut runner = Runner::new(job).report_to(alive);
+        let work = Work::new(&[]);
+        assert_eq!(
+            work.round(&mut runner, &ledger, "2026-10-12T04:00:00Z")
+                .await,
+            None
+        );
+        let t = crate::supervise::snapshot()
+            .into_iter()
+            .find(|t| t.name == "schedule off under test")
+            .unwrap();
+        assert_eq!((t.expected, t.next_due), (None, None));
+    }
+
+    #[test]
+    fn rule_intervals() {
+        let day = Duration::from_secs(86_400);
+        assert_eq!(Rule::daily(hm(7, 0)).interval(), Some(day));
+        assert_eq!(Rule::Daily { at: vec![] }.interval(), None);
+        assert_eq!(
+            Rule::Weekly {
+                day: Weekday::Mon,
+                at: hm(7, 0)
+            }
+            .interval(),
+            Some(7 * day)
+        );
+        assert_eq!(
+            Rule::Monthly {
+                day: 1,
+                at: hm(7, 0)
+            }
+            .interval(),
+            Some(31 * day)
+        );
+    }
+
+    #[tokio::test]
     async fn run_runs_a_due_slot_right_away() {
         let (ledger, _dir) = open_ledger(false, None).await;
         let now = BERLIN.now().naive_local();
@@ -1364,15 +1558,10 @@ mod tests {
             Some(rule.clone())
         });
         let (sent, mut ran) = tokio::sync::mpsc::unbounded_channel();
-        let task = tokio::spawn(run_with(
-            job,
-            ledger.clone(),
-            || {},
-            move |slot: Slot| {
-                sent.send(slot).unwrap();
-                async { Outcome::Done }
-            },
-        ));
+        let task = tokio::spawn(run_with(job, ledger.clone(), None, move |slot: Slot| {
+            sent.send(slot).unwrap();
+            async { Outcome::Done }
+        }));
         let slot = tokio::time::timeout(Duration::from_secs(5), ran.recv())
             .await
             .unwrap()

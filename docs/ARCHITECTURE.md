@@ -328,3 +328,54 @@ setting on `parse_as`, metrics from `supervise`/`send` once the network question
    records the latest digest slot as done instead of catching it up (the old version wrote
    no `digest:` rows, and had posted it). Not done: `Bot::broadcast_once` (bot.rs is shared; `schedule::post` covers it), calendar's
    catch-up after midnight rendering the new day (B10, it changes what residents see).
+
+## Status file for monitoring (2026-10-31)
+
+The heartbeat says only "healthy or not" and lives in the store, which monitoring must never
+mount. `status` adds a file of its own, independent of Matrix:
+
+- `$MXBOT_STATUS_FILE` (house-infra: `/app/status/status.json`, a directory of its own, not in
+  the store), written by `Bot::builder(..).start(..)` at start and every 30 s, atomically (a
+  temporary file made 0644, then renamed; never fsynced: it only describes the running
+  process, a file lost to a power loss costs nothing). No variable, no file. Schema version 1
+  in `src/status.rs`.
+- Tasks: every `supervise` (`supervised`), `supervise_ticking` (`ticking`), `schedule::run`
+  job (`scheduled`) and `supervise::report(name)` (`reported`: rounds counted, never affects
+  the heartbeat). Per task: last tick, last ok (`ok` or `idle`), last error with a reason
+  (`status::sanitize_reason`: one line, ≤ 160 characters, URL user info/query, the value of
+  any secret-ish key with `:` or `=` (JSON, headers, query), Bearer/Basic credentials and
+  token-like words removed), failures in a row, totals ok/idle/failed/gave_up, the last
+  give-up's time, last outcome, expected interval, next due.
+- `Alive`: `tick`, `ok`, `failed` as before; new `idle()` (nothing to do: healthy),
+  `gave_up(reason)` (counted as failed too), `expect_every(Duration)` (status only; the
+  heartbeat still follows `within`), `next_due(Option<SystemTime>)`.
+- `schedule::run`: Done → ok, Skipped → idle, RetryIn → failed, a slot past its catch-up window
+  or an at-most-once slot that failed → gave_up, ledger errors → failed; the rule's interval
+  (a day, a week, 31 days) as the expected one, the next due slot (the pending one while it is
+  retried). `Runner::report_to(alive)` for tests and hand-driven runners.
+- Matrix: `status::sync_ok()` at every sync response, `sync_failed()` per failed first sync or
+  reconnect (`sync.rs`): "Matrix down" (all bots' `last_sync_ok` old) is told apart from "a
+  task broken".
+- `status::queue(name).set(pending, oldest_age)` / `set_since(pending, oldest)` for outboxes,
+  `status::gauge(name).set(f64)` for a bot's own numbers.
+
+The house-infra exporter (`house-exporters bot-status`) reads only this file per bot.
+
+## The house directory: people, links, rooms, admins (2026-10-31)
+
+The design is house-infra's docs/HOUSE-DIRECTORY.md; here what lives in this crate (feature
+`directory`):
+
+- `directory`: `People` (a person keyed by the provider's uuid; house account, links an admin
+  entered or the person proved, their chosen account), `Contact` (chosen, unchosen, invalid;
+  the house account is never chosen for anyone), conflicts (an account two active people claim
+  counts for nobody), `Snapshot` (one read, its age, `is_stale`). A read is all or nothing.
+- `link`: the link code a person gets from the directory bot for `!link <username>` and enters
+  in the provider's flow; the provider computes the same code (shared test vectors).
+- `membership`: the pure plan of a room that follows directory groups, its guards (stale or
+  failed read, empty house group, unknown group, mass-removal hold confirmed by digest) and
+  what is remembered between rounds. plenum-bot does the Matrix side; cleaning-bot keeps its
+  own reconcile for the plan (same ideas; a shared helper is a follow-up).
+- `admin::Admins`: the configured admins plus, with `[security] admin_groups`, the house
+  accounts of those groups' members while the last read is fresh. Shared by the admin console
+  and the invite policy; a linked account is never an admin.

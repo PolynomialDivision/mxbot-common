@@ -71,6 +71,7 @@ impl BotBuilder {
         // Fail closed: a forgotten allow-list must not open the bot up.
         security.validate()?;
         sync::listen_for_stop();
+        crate::status::start(self.name.clone());
         let mut matrix = matrix.clone();
         matrix.apply_env_overrides();
 
@@ -118,11 +119,14 @@ impl BotBuilder {
             warn!("No users may verify with the bot without an administrative grant");
         }
 
+        // One list for the invites and the console: admins a bot takes from the directory's
+        // groups (AdminConsole::admin_list().follow) may open their direct chat with it too.
+        let admin_list = crate::admin::Admins::new((*admins).clone());
         let invites = InvitePolicy {
             inviters: security.allowed_inviters.clone(),
             rooms: security.allowed_rooms.clone(),
             dynamic_rooms: self.dynamic_rooms,
-            admins: Arc::clone(&admins),
+            admins: admin_list.clone(),
             dm_rooms: Arc::clone(&dm_rooms),
         };
         rooms::install_invite_handler(&client, invites.clone());
@@ -131,7 +135,7 @@ impl BotBuilder {
             client.clone(),
             self.name.clone(),
             self.version,
-            Arc::clone(&admins),
+            admin_list,
             security.admin_dm.clone(),
             security.trust,
             verification.clone(),
@@ -179,7 +183,9 @@ impl Bot {
         self.admin.is_admin(user_id)
     }
 
-    pub fn admins(&self) -> &HashSet<OwnedUserId> {
+    /// Everyone who is an admin now (the configured ones and, for a bot that follows the
+    /// directory's admin groups, theirs).
+    pub fn admins(&self) -> HashSet<OwnedUserId> {
         self.admin.admins()
     }
 
@@ -267,7 +273,7 @@ impl Bot {
         rooms::broadcast_rooms(
             &self.client,
             &self.invites.rooms,
-            self.admins(),
+            &self.admins(),
             self.admin_dms_receive_broadcasts,
         )
     }

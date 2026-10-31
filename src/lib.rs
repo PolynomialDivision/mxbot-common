@@ -13,6 +13,7 @@
 //! * [`heartbeat`]: optional liveness file for container health checks.
 //! * [`supervise`]: background loops whose end restarts the bot, and whose
 //!   missing rounds stop the heartbeat.
+//! * [`status`]: the bot's status file for monitoring (tasks, queues, Matrix sync).
 //! * [`trust`]: whose devices count (`[security] trust`).
 //! * [`command`] / [`reply`] / [`reaction`]: a bot's command table (parse, help,
 //!   who may run what), the replies' status emoji, reactions as buttons.
@@ -20,6 +21,9 @@
 //!   a Nextcloud account's own calendars (make, share, write events), for plenum-bot and
 //!   cleaning-bot.
 //! * `directory` (feature `directory`): the house's directory (people, accounts, groups).
+//! * `link` (feature `directory`): link codes that prove a person's other Matrix account.
+//! * `membership` (feature `directory`): rooms whose members follow the directory (the plan of
+//!   a round, its guards, what is remembered); plenum-bot does the Matrix side.
 //! * `clock` / `schedule` (feature `schedule`): the bot's time zone and one DST rule; daily,
 //!   weekly and monthly jobs with per-period slots, a ledger, catch-up after a restart and
 //!   posts with stable transaction IDs.
@@ -41,8 +45,12 @@ pub mod directory;
 pub mod events;
 pub mod format;
 pub mod heartbeat;
+#[cfg(feature = "directory")]
+pub mod link;
 pub mod logging;
 pub mod media;
+#[cfg(feature = "directory")]
+pub mod membership;
 pub mod persist;
 pub mod private;
 pub mod reaction;
@@ -56,6 +64,7 @@ pub mod session;
 pub mod settings;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
+pub mod status;
 pub mod supervise;
 pub mod sync;
 pub mod trust;

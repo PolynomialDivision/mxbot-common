@@ -235,6 +235,10 @@ pub struct SecurityConfig {
     /// Users allowed to run administrative commands.
     #[serde(default)]
     pub admin_users: Vec<String>,
+    /// Directory groups whose members' house accounts are admins too, for bots that read the
+    /// directory and follow it ([`crate::admin::Admins::follow`]); linked accounts never are.
+    #[serde(default)]
+    pub admin_groups: Vec<String>,
     #[serde(default)]
     pub encryption_strategy: EncryptionStrategy,
     #[serde(default)]

@@ -24,8 +24,19 @@
 //!
 //! Bot-specific commands sent by an admin in such a chat are reported as
 //! [`Dispatch::AdminDm`] so the bot can run them and answer privately.
+//!
+//! Who is an admin ([`Admins`]): the configured `admin_users`, plus, for a bot that reads the
+//! directory, the house accounts of the members of `[security] admin_groups` while its last
+//! directory read is fresh ([`Admins::follow`]). A linked account never makes anyone an admin,
+//! and a directory the bot could not read for too long leaves only the configured list. The
+//! same list decides whose invites the bot always accepts, a direct chat included
+//! ([`crate::rooms::InvitePolicy`]): an admin from the groups can open their console chat.
 
-use std::{collections::HashSet, sync::Arc, time::Instant};
+use std::{
+    collections::HashSet,
+    sync::{Arc, RwLock},
+    time::{Instant, SystemTime},
+};
 
 use matrix_sdk::{
     deserialized_responses::{EncryptionInfo, VerificationLevel, VerificationState},
@@ -58,6 +69,112 @@ impl std::fmt::Display for NotAdmin {
 }
 
 impl std::error::Error for NotAdmin {}
+
+/// The bot's admins: the configured list, and those taken from the directory's admin groups
+/// until their read is too old. Cheap to clone; clones share the directory's part.
+#[derive(Clone, Debug, Default)]
+pub struct Admins {
+    fixed: Arc<HashSet<OwnedUserId>>,
+    from_groups: Arc<RwLock<FromGroups>>,
+}
+
+#[derive(Debug, Default)]
+struct FromGroups {
+    ids: HashSet<OwnedUserId>,
+    until: Option<SystemTime>,
+}
+
+impl From<HashSet<OwnedUserId>> for Admins {
+    fn from(fixed: HashSet<OwnedUserId>) -> Self {
+        Self::new(fixed)
+    }
+}
+
+impl Admins {
+    pub fn new(fixed: HashSet<OwnedUserId>) -> Self {
+        Self {
+            fixed: Arc::new(fixed),
+            from_groups: Arc::default(),
+        }
+    }
+
+    pub fn contains(&self, user_id: &UserId) -> bool {
+        self.contains_at(user_id, SystemTime::now())
+    }
+
+    fn contains_at(&self, user_id: &UserId, now: SystemTime) -> bool {
+        self.fixed.contains(user_id) || {
+            let g = self.from_groups.read().unwrap_or_else(|e| e.into_inner());
+            g.until.is_some_and(|until| now <= until) && g.ids.contains(user_id)
+        }
+    }
+
+    /// The configured admins.
+    pub fn fixed(&self) -> &HashSet<OwnedUserId> {
+        &self.fixed
+    }
+
+    /// Everyone who is an admin now.
+    pub fn current(&self) -> HashSet<OwnedUserId> {
+        self.current_at(SystemTime::now())
+    }
+
+    fn current_at(&self, now: SystemTime) -> HashSet<OwnedUserId> {
+        let mut out = (*self.fixed).clone();
+        let g = self.from_groups.read().unwrap_or_else(|e| e.into_inner());
+        if g.until.is_some_and(|until| now <= until) {
+            out.extend(g.ids.iter().cloned());
+        }
+        out
+    }
+
+    /// Admins from the directory's groups, valid until `until` (the read's time plus how
+    /// long a read may be used); the changes are logged. A later call replaces them.
+    pub fn set_from_groups(&self, ids: HashSet<OwnedUserId>, until: SystemTime) {
+        let mut g = self.from_groups.write().unwrap_or_else(|e| e.into_inner());
+        let mut added: Vec<&OwnedUserId> = ids.difference(&g.ids).collect();
+        let mut removed: Vec<&OwnedUserId> = g.ids.difference(&ids).collect();
+        if !added.is_empty() || !removed.is_empty() {
+            added.sort();
+            removed.sort();
+            info!(
+                ?added,
+                ?removed,
+                "Admins from the directory's groups changed"
+            );
+        }
+        g.ids = ids;
+        g.until = Some(until);
+    }
+
+    /// Follow the admin groups of a directory read: the house accounts (never linked ones) of
+    /// their active members, for as long as the read may be used.
+    #[cfg(feature = "directory")]
+    pub fn follow(
+        &self,
+        snapshot: &crate::directory::Snapshot,
+        cfg: &crate::directory::DirectoryConfig,
+        groups: &[String],
+    ) {
+        self.set_from_groups(
+            from_groups(&snapshot.people, groups),
+            snapshot.read_at + cfg.stale_after(),
+        );
+    }
+}
+
+/// The house accounts of the active members of `groups`; an account another person claims
+/// too counts for nobody.
+#[cfg(feature = "directory")]
+pub fn from_groups(people: &crate::directory::People, groups: &[String]) -> HashSet<OwnedUserId> {
+    people
+        .active()
+        .filter(|p| groups.iter().any(|g| p.groups.contains(g)))
+        .filter_map(|p| p.house.as_ref())
+        .filter(|house| !people.is_conflict(house))
+        .cloned()
+        .collect()
+}
 
 /// `Ok` if `user_id` is one of `admins`, otherwise [`NotAdmin`].
 pub fn require_admin(admins: &HashSet<OwnedUserId>, user_id: &UserId) -> Result<(), NotAdmin> {
@@ -97,7 +214,7 @@ struct Inner {
     client: Client,
     bot_name: String,
     version: String,
-    admins: Arc<HashSet<OwnedUserId>>,
+    admins: Admins,
     policy: AdminDmConfig,
     trust: Trust,
     verification: VerificationService,
@@ -131,7 +248,7 @@ impl AdminConsole {
         client: Client,
         bot_name: String,
         version: String,
-        admins: Arc<HashSet<OwnedUserId>>,
+        admins: Admins,
         policy: AdminDmConfig,
         trust: Trust,
         verification: VerificationService,
@@ -158,13 +275,19 @@ impl AdminConsole {
         self.inner.admins.contains(user_id)
     }
 
-    pub fn admins(&self) -> &HashSet<OwnedUserId> {
+    /// Everyone who is an admin now.
+    pub fn admins(&self) -> HashSet<OwnedUserId> {
+        self.inner.admins.current()
+    }
+
+    /// The admins, to follow the directory's admin groups ([`Admins::follow`]).
+    pub fn admin_list(&self) -> &Admins {
         &self.inner.admins
     }
 
     /// Whether `room` is a direct chat with one of the admins.
     pub fn is_admin_dm(&self, room: &Room) -> bool {
-        admin_dm_partner(room, &self.inner.admins).is_some()
+        admin_dm_partner(room, &self.admins()).is_some()
     }
 
     /// Whether a message that isn't text (a file, say) passes what a console
@@ -188,7 +311,7 @@ impl AdminConsole {
         if !self.inner.policy.enabled || !self.is_admin(sender) {
             return Access::None;
         }
-        if admin_dm_partner(room, &self.inner.admins).as_deref() != Some(sender) {
+        if admin_dm_partner(room, &self.admins()).as_deref() != Some(sender) {
             return Access::None;
         }
         if self.inner.policy.require_encryption
@@ -456,7 +579,7 @@ impl AdminConsole {
                 "NOT signed"
             },
             self.inner.verification.trust_summary(sender).await,
-            self.inner.admins.len(),
+            self.admins().len(),
             required(self.inner.policy.require_encryption),
             required(self.inner.policy.require_verified_device),
             match self.inner.trust {
@@ -684,5 +807,77 @@ mod tests {
             parse("!reset-trust nope"),
             Some(Command::Invalid(_))
         ));
+    }
+
+    #[test]
+    fn admins_from_groups_last_until_their_read_is_too_old() {
+        use std::time::Duration;
+        let owner = user_id!("@owner:example.org").to_owned();
+        let anna = user_id!("@anna:house.org").to_owned();
+        let admins = Admins::new(HashSet::from([owner.clone()]));
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        assert!(admins.contains_at(&owner, t0));
+        assert!(!admins.contains_at(&anna, t0));
+
+        admins.set_from_groups(
+            HashSet::from([anna.clone()]),
+            t0 + Duration::from_secs(3600),
+        );
+        assert!(admins.contains_at(&anna, t0));
+        assert_eq!(admins.current_at(t0).len(), 2);
+        // the directory could not be read for too long: only the configured ones
+        let late = t0 + Duration::from_secs(3601);
+        assert!(!admins.contains_at(&anna, late));
+        assert!(admins.contains_at(&owner, late));
+        assert_eq!(admins.current_at(late), HashSet::from([owner.clone()]));
+        // Person G leaves the admin group: gone at the next read; clones share it
+        let clone = admins.clone();
+        admins.set_from_groups(HashSet::new(), t0 + Duration::from_secs(7200));
+        assert!(!clone.contains_at(&anna, t0));
+        assert_eq!(admins.fixed(), &HashSet::from([owner]));
+    }
+
+    #[cfg(feature = "directory")]
+    #[test]
+    fn admin_groups_give_house_accounts_only() {
+        use crate::directory::{Choice, Link, People, Person};
+        let person = |id: &str, groups: &[&str], active: bool, links: &[&str]| {
+            let house = OwnedUserId::try_from(format!("@{id}:house.org")).unwrap();
+            let links: Vec<Link> = links
+                .iter()
+                .map(|l| Link {
+                    id: OwnedUserId::try_from(*l).unwrap(),
+                    by_admin: true,
+                    verified: true,
+                })
+                .collect();
+            Person {
+                id: id.into(),
+                username: id.into(),
+                name: String::new(),
+                active,
+                accounts: std::iter::once(house.clone())
+                    .chain(links.iter().map(|l| l.id.clone()))
+                    .collect(),
+                groups: groups.iter().map(|g| g.to_string()).collect(),
+                house: Some(house),
+                links,
+                choice: Choice::None,
+            }
+        };
+        let people = People::new(vec![
+            person("anna", &["it-admins"], true, &["@anna:matrix.org"]),
+            person("ben", &["residents"], true, &[]),
+            person("gone", &["it-admins"], false, &[]),
+            person("cara", &["house-admins"], true, &[]),
+        ]);
+        let groups = ["it-admins".to_owned(), "house-admins".to_owned()];
+        assert_eq!(
+            from_groups(&people, &groups),
+            HashSet::from([
+                user_id!("@anna:house.org").to_owned(),
+                user_id!("@cara:house.org").to_owned()
+            ])
+        );
     }
 }

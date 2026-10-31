@@ -10,8 +10,9 @@ default = []
 testing = ["matrix-sdk/testing"]
 # iCalendar and CalDAV (src/calendar): calendar-bot, plenum-bot.
 calendar = ["dep:calcard", "dep:chrono", "dep:chrono-tz", "dep:reqwest", "dep:rrule"]
-# The house's directory (src/directory.rs): plenum-bot, cleaning-bot.
-directory = ["dep:reqwest"]
+# The house's directory (src/directory.rs), link codes (src/link.rs) and rooms that follow it
+# (src/membership.rs): plenum-bot, cleaning-bot.
+directory = ["dep:chrono", "dep:reqwest"]
 # Markdown messages (format::markdown): plenum-bot, health-bot.
 markdown = ["dep:pulldown-cmark"]
 # Time zone and DST rule (src/clock.rs), scheduled jobs (src/schedule.rs): calendar-bot, radar-bot.
@@ -26,7 +27,8 @@ web = ["dep:http", "dep:subtle"]
 anyhow             = "1"
 # iCalendar reading (time zones, VTIMEZONE, Windows names) and recurrence rules (src/calendar/ics.rs).
 calcard            = { version = "0.3", default-features = false, optional = true }
-chrono             = { version = "0.4", optional = true }
+# serde: the membership state keeps its times as RFC 3339, as plenum-bot's state.json did.
+chrono             = { version = "0.4", features = ["serde"], optional = true }
 chrono-tz          = { version = "0.10", optional = true }
 rrule              = { version = "0.14", optional = true }
 reqwest            = { version = "0.13", default-features = false, features = ["rustls"], optional = true }
