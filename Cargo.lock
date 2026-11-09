@@ -1756,9 +1756,9 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
 name = "libsqlite3-sys"
-version = "0.38.2"
+version = "0.39.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f1d20bef17f513b9b3004532233187769cd072d790971f4e4da0e346eb6401e8"
+checksum = "14a5f01b87b92705d07b433c06f96cbc764637d81a0bffb5734ce17cf0f9a2b3"
 dependencies = [
  "pkg-config",
  "vcpkg",
@@ -1971,7 +1971,7 @@ dependencies = [
 [[package]]
 name = "matrix-sdk"
 version = "0.19.1"
-source = "git+https://github.com/PolynomialDivision/matrix-rust-sdk?branch=msc3952-mentions-encrypted-0.19#694e5b146423d5f9d0ae75a4c215a85f5d21d214"
+source = "git+https://github.com/PolynomialDivision/matrix-rust-sdk?branch=msc3952-mentions-encrypted-0.19#1c658d5557893432cd038e6c563b2149e687cfb1"
 dependencies = [
  "anymap2",
  "as_variant",
@@ -2027,7 +2027,7 @@ dependencies = [
 [[package]]
 name = "matrix-sdk-base"
 version = "0.19.1"
-source = "git+https://github.com/PolynomialDivision/matrix-rust-sdk?branch=msc3952-mentions-encrypted-0.19#694e5b146423d5f9d0ae75a4c215a85f5d21d214"
+source = "git+https://github.com/PolynomialDivision/matrix-rust-sdk?branch=msc3952-mentions-encrypted-0.19#1c658d5557893432cd038e6c563b2149e687cfb1"
 dependencies = [
  "as_variant",
  "assert_matches",
@@ -2058,7 +2058,7 @@ dependencies = [
 [[package]]
 name = "matrix-sdk-common"
 version = "0.19.1"
-source = "git+https://github.com/PolynomialDivision/matrix-rust-sdk?branch=msc3952-mentions-encrypted-0.19#694e5b146423d5f9d0ae75a4c215a85f5d21d214"
+source = "git+https://github.com/PolynomialDivision/matrix-rust-sdk?branch=msc3952-mentions-encrypted-0.19#1c658d5557893432cd038e6c563b2149e687cfb1"
 dependencies = [
  "eyeball-im",
  "futures-core",
@@ -2081,7 +2081,7 @@ dependencies = [
 [[package]]
 name = "matrix-sdk-crypto"
 version = "0.19.1"
-source = "git+https://github.com/PolynomialDivision/matrix-rust-sdk?branch=msc3952-mentions-encrypted-0.19#694e5b146423d5f9d0ae75a4c215a85f5d21d214"
+source = "git+https://github.com/PolynomialDivision/matrix-rust-sdk?branch=msc3952-mentions-encrypted-0.19#1c658d5557893432cd038e6c563b2149e687cfb1"
 dependencies = [
  "aes",
  "as_variant",
@@ -2121,7 +2121,7 @@ dependencies = [
 [[package]]
 name = "matrix-sdk-indexeddb"
 version = "0.19.1"
-source = "git+https://github.com/PolynomialDivision/matrix-rust-sdk?branch=msc3952-mentions-encrypted-0.19#694e5b146423d5f9d0ae75a4c215a85f5d21d214"
+source = "git+https://github.com/PolynomialDivision/matrix-rust-sdk?branch=msc3952-mentions-encrypted-0.19#1c658d5557893432cd038e6c563b2149e687cfb1"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -2153,7 +2153,7 @@ dependencies = [
 [[package]]
 name = "matrix-sdk-sqlite"
 version = "0.19.1"
-source = "git+https://github.com/PolynomialDivision/matrix-rust-sdk?branch=msc3952-mentions-encrypted-0.19#694e5b146423d5f9d0ae75a4c215a85f5d21d214"
+source = "git+https://github.com/PolynomialDivision/matrix-rust-sdk?branch=msc3952-mentions-encrypted-0.19#1c658d5557893432cd038e6c563b2149e687cfb1"
 dependencies = [
  "as_variant",
  "async-trait",
@@ -2181,7 +2181,7 @@ dependencies = [
 [[package]]
 name = "matrix-sdk-store-encryption"
 version = "0.19.1"
-source = "git+https://github.com/PolynomialDivision/matrix-rust-sdk?branch=msc3952-mentions-encrypted-0.19#694e5b146423d5f9d0ae75a4c215a85f5d21d214"
+source = "git+https://github.com/PolynomialDivision/matrix-rust-sdk?branch=msc3952-mentions-encrypted-0.19#1c658d5557893432cd038e6c563b2149e687cfb1"
 dependencies = [
  "base64 0.23.1",
  "blake3",
@@ -2203,7 +2203,7 @@ dependencies = [
 [[package]]
 name = "matrix-sdk-test"
 version = "0.19.1"
-source = "git+https://github.com/PolynomialDivision/matrix-rust-sdk?branch=msc3952-mentions-encrypted-0.19#694e5b146423d5f9d0ae75a4c215a85f5d21d214"
+source = "git+https://github.com/PolynomialDivision/matrix-rust-sdk?branch=msc3952-mentions-encrypted-0.19#1c658d5557893432cd038e6c563b2149e687cfb1"
 dependencies = [
  "as_variant",
  "ctor",
@@ -2226,7 +2226,7 @@ dependencies = [
 [[package]]
 name = "matrix-sdk-test-macros"
 version = "0.19.1"
-source = "git+https://github.com/PolynomialDivision/matrix-rust-sdk?branch=msc3952-mentions-encrypted-0.19#694e5b146423d5f9d0ae75a4c215a85f5d21d214"
+source = "git+https://github.com/PolynomialDivision/matrix-rust-sdk?branch=msc3952-mentions-encrypted-0.19#1c658d5557893432cd038e6c563b2149e687cfb1"
 dependencies = [
  "quote",
  "syn 3.0.6",
@@ -3114,9 +3114,9 @@ dependencies = [
 
 [[package]]
 name = "rusqlite"
-version = "0.40.2"
+version = "0.41.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "23f2a97da3e3873c73cb2a2e71b35c40ff95e0b1eefa8d72d8499a6928c3b5b3"
+checksum = "da9bba6f3506135e120a6586df05be18b48d18896600646a4bec8f993d91a594"
 dependencies = [
  "bitflags",
  "fallible-iterator",
@@ -3647,7 +3647,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",

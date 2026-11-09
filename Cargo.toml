@@ -45,7 +45,7 @@ pulldown-cmark     = { version = "0.13", default-features = false, features = ["
 matrix-sdk         = { git = "https://github.com/PolynomialDivision/matrix-rust-sdk", branch = "msc3952-mentions-encrypted-0.19", features = ["e2e-encryption", "sqlite", "automatic-room-key-forwarding"] }
 matrix-sdk-crypto  = { git = "https://github.com/PolynomialDivision/matrix-rust-sdk", branch = "msc3952-mentions-encrypted-0.19" }
 # SQLite stores (sqlite): the version the SDK's sqlite store already links; no bundled build here.
-rusqlite           = { version = "0.40", default-features = false, optional = true }
+rusqlite           = { version = "0.41", default-features = false, optional = true }
 serde              = { version = "1", features = ["derive"] }
 # Stable transaction IDs (send::txn_for); the SDK has it already.
 sha2               = "0.10"
