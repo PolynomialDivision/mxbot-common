@@ -293,8 +293,14 @@ impl InvitePolicy {
 
 /// Returns true for Matrix join errors that will not resolve with a retry.
 pub fn is_join_terminal(error: &matrix_sdk::Error) -> bool {
-    let message = error.to_string();
+    is_terminal_join_message(&error.to_string())
+}
+
+/// "Not an active room on this server": the room is gone, or no server of it is left (an old
+/// invite); retrying only delays the start (and the heartbeat) by minutes.
+fn is_terminal_join_message(message: &str) -> bool {
     message.contains("No known servers")
+        || message.contains("Not an active room on this server")
         || message.contains("M_FORBIDDEN")
         || message.contains("M_UNKNOWN_TOKEN")
         || message.contains("M_GUEST_ACCESS_FORBIDDEN")
@@ -577,6 +583,18 @@ mod tests {
             dm_rooms: Arc::default(),
             dm_accounts: DmAccounts::default(),
         }
+    }
+
+    #[test]
+    fn a_room_no_server_knows_is_not_retried() {
+        // kummerkasten-bot's old invite, as matrix.org answered it on 2026-11-26.
+        assert!(is_terminal_join_message(
+            "the server returned an error: [404 / M_NOT_FOUND] Answer from matrix.org: \
+             [404 / M_NOT_FOUND] Not an active room on this server"
+        ));
+        assert!(!is_terminal_join_message(
+            "the server returned an error: [502] Bad Gateway"
+        ));
     }
 
     #[test]
