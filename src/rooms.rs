@@ -299,11 +299,25 @@ pub fn is_join_terminal(error: &matrix_sdk::Error) -> bool {
 /// "Not an active room on this server": the room is gone, or no server of it is left (an old
 /// invite); retrying only delays the start (and the heartbeat) by minutes.
 fn is_terminal_join_message(message: &str) -> bool {
-    message.contains("No known servers")
-        || message.contains("Not an active room on this server")
+    is_gone_room_message(message)
         || message.contains("M_FORBIDDEN")
         || message.contains("M_UNKNOWN_TOKEN")
         || message.contains("M_GUEST_ACCESS_FORBIDDEN")
+}
+
+/// No server knows the room any more: an invite to it can never be accepted.
+fn is_gone_room_message(message: &str) -> bool {
+    message.contains("No known servers") || message.contains("Not an active room on this server")
+}
+
+/// How a join ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JoinOutcome {
+    Joined,
+    /// No server knows the room any more (an old invite to a room that is gone).
+    Gone,
+    /// Refused, or still failing after the retries.
+    Failed,
 }
 
 /// Via servers for joining: the inviter's server always knows the room;
@@ -325,6 +339,11 @@ fn via_servers(room_id: &RoomId, inviter: Option<&UserId>) -> Vec<OwnedServerNam
 
 /// Join a room, retrying transient failures with exponential backoff.
 pub async fn join_with_retry(client: &Client, room_id: &RoomId, inviter: Option<&UserId>) -> bool {
+    join_room(client, room_id, inviter).await == JoinOutcome::Joined
+}
+
+/// [`join_with_retry`], with how it ended.
+pub async fn join_room(client: &Client, room_id: &RoomId, inviter: Option<&UserId>) -> JoinOutcome {
     let via = via_servers(room_id, inviter);
     let room_or_alias: &RoomOrAliasId = room_id.into();
     let mut backoff = Backoff::new(Duration::from_secs(2), Duration::from_secs(300));
@@ -332,11 +351,15 @@ pub async fn join_with_retry(client: &Client, room_id: &RoomId, inviter: Option<
         match client.join_room_by_id_or_alias(room_or_alias, &via).await {
             Ok(_) => {
                 info!(room_id = %room_id, "Joined room");
-                return true;
+                return JoinOutcome::Joined;
+            }
+            Err(ref error) if is_gone_room_message(&error.to_string()) => {
+                warn!(room_id = %room_id, %error, "Join failed: no server knows the room any more");
+                return JoinOutcome::Gone;
             }
             Err(ref error) if is_join_terminal(error) => {
                 warn!(room_id = %room_id, %error, "Join failed with a non-retryable error");
-                return false;
+                return JoinOutcome::Failed;
             }
             Err(error) if attempt == JOIN_MAX_ATTEMPTS => {
                 warn!(room_id = %room_id, %error, "Join failed after {JOIN_MAX_ATTEMPTS} attempts");
@@ -353,7 +376,7 @@ pub async fn join_with_retry(client: &Client, room_id: &RoomId, inviter: Option<
             }
         }
     }
-    false
+    JoinOutcome::Failed
 }
 
 /// Whether `user` is joined to one of `rooms` right now (asked of the
@@ -441,7 +464,13 @@ async fn handle_invite(
     let rejected = match (plan, inviter.as_deref()) {
         (InvitePlan::Join, _) => {
             info!(room_id = %room_id, inviter = ?inviter, is_direct, "Accepting invite");
-            join_with_retry(&client, &room_id, inviter.as_deref()).await;
+            if join_room(&client, &room_id, inviter.as_deref()).await == JoinOutcome::Gone {
+                // otherwise it stays pending and is tried again at every start
+                info!(room_id = %room_id, "Rejecting the invite: the room is gone");
+                if let Err(error) = room.leave().await {
+                    warn!(room_id = %room_id, %error, "Failed to reject invite");
+                }
+            }
             return;
         }
         (InvitePlan::PrivateDm, Some(user)) => {
@@ -504,23 +533,29 @@ pub fn install_invite_handler(client: &Client, policy: InvitePolicy) {
 /// Process invites that arrived while the bot was offline.
 ///
 /// `StrippedRoomMemberEvent` only fires for invites received during this
-/// session, not for ones already persisted in the store.
+/// session, not for ones already persisted in the store. Each invite is handled in a task
+/// of its own, as the runtime handler does: a join that retries for minutes (a server
+/// that is down) does not hold up the start, the sync loop or its heartbeat.
 pub async fn join_pending_invites(client: &Client, policy: &InvitePolicy) {
     let invited = client.invited_rooms();
     if invited.is_empty() {
         return;
     }
     info!(count = invited.len(), "Processing pending invites");
+    let policy = Arc::new(policy.clone());
     for room in invited {
-        let inviter = match room.invite_details().await {
-            Ok(details) => Some(details.inviter_id),
-            Err(error) => {
-                warn!(room_id = %room.room_id(), %error, "Could not determine inviter of pending invite");
-                None
-            }
-        };
-        let is_direct = room.is_direct().await.unwrap_or(false);
-        handle_invite(client.clone(), room, policy, inviter, is_direct).await;
+        let (client, policy) = (client.clone(), Arc::clone(&policy));
+        tokio::spawn(async move {
+            let inviter = match room.invite_details().await {
+                Ok(details) => Some(details.inviter_id),
+                Err(error) => {
+                    warn!(room_id = %room.room_id(), %error, "Could not determine inviter of pending invite");
+                    None
+                }
+            };
+            let is_direct = room.is_direct().await.unwrap_or(false);
+            handle_invite(client, room, &policy, inviter, is_direct).await;
+        });
     }
 }
 
@@ -594,6 +629,12 @@ mod tests {
         ));
         assert!(!is_terminal_join_message(
             "the server returned an error: [502] Bad Gateway"
+        ));
+        assert!(is_gone_room_message(
+            "[404 / M_NOT_FOUND] Not an active room on this server"
+        ));
+        assert!(!is_gone_room_message(
+            "[403 / M_FORBIDDEN] You are not invited"
         ));
     }
 
